@@ -1,0 +1,562 @@
+pub mod arm7tdmi;
+pub mod bios;
+pub mod bus;
+pub mod ppu;
+pub mod apu;
+pub mod backup;
+pub mod dma;
+pub mod timer;
+pub mod interrupt;
+pub mod keypad;
+pub mod scheduler;
+
+use arm7tdmi::Cpu;
+use bus::Bus;
+use dma::DmaTiming;
+use scheduler::{Event, EventKind, Scheduler};
+use serde::{Deserialize, Serialize};
+
+/// GBA timing constants
+pub const CPU_CLOCK_HZ: u32 = 16_777_216; // 16.78 MHz
+pub const CYCLES_PER_DOT: u32 = 4;
+pub const DOTS_PER_LINE: u32 = 308; // 240 visible + 68 HBlank
+pub const CYCLES_PER_LINE: u32 = DOTS_PER_LINE * CYCLES_PER_DOT; // 1232
+pub const VISIBLE_LINES: u16 = 160;
+pub const VBLANK_LINES: u16 = 68;
+pub const LINES_PER_FRAME: u16 = VISIBLE_LINES + VBLANK_LINES; // 228
+pub const CYCLES_PER_FRAME: u64 = CYCLES_PER_LINE as u64 * LINES_PER_FRAME as u64; // 280896
+pub const SCREEN_WIDTH: usize = 240;
+pub const SCREEN_HEIGHT: usize = 160;
+
+/// Visible pixel portion of a scanline in cycles
+pub const HDRAW_CYCLES: u32 = 240 * CYCLES_PER_DOT; // 960
+/// HBlank portion of a scanline in cycles
+pub const HBLANK_CYCLES: u32 = 68 * CYCLES_PER_DOT; // 272
+
+#[derive(Serialize, Deserialize)]
+pub struct Gba {
+    pub cpu: Cpu,
+    pub bus: Bus,
+    pub scheduler: Scheduler,
+    /// 240x160 framebuffer, 15-bit RGB (xBBBBBGGGGGRRRRR)
+    frame_buffer: Vec<u16>,
+}
+
+impl Gba {
+    /// Create a new GBA instance with optional BIOS and a ROM.
+    pub fn new(bios: Option<Vec<u8>>, rom: Vec<u8>) -> Self {
+        let mut scheduler = Scheduler::new();
+        // Schedule the first HBlank event
+        scheduler.schedule(Event {
+            fire_time: HDRAW_CYCLES as u64,
+            kind: EventKind::HBlank,
+        });
+
+        let bus = Bus::new(bios, rom);
+        let cpu = Cpu::new();
+
+        Gba {
+            cpu,
+            bus,
+            scheduler,
+            frame_buffer: vec![0u16; SCREEN_WIDTH * SCREEN_HEIGHT],
+        }
+    }
+
+    /// Run the emulator for one full frame (~280896 cycles).
+    /// Returns a reference to the 240x160 framebuffer.
+    pub fn run_frame(&mut self) -> &[u16] {
+        let frame_end = self.scheduler.timestamp() + CYCLES_PER_FRAME;
+
+        while self.scheduler.timestamp() < frame_end {
+            let next_event_time = self.scheduler.peek_time().unwrap_or(frame_end);
+            let target = next_event_time.min(frame_end);
+
+            // Step CPU until next event
+            while self.scheduler.timestamp() < target {
+                if self.cpu.halted {
+                    // Fast-forward to the next event
+                    self.scheduler.advance_to(target);
+                    break;
+                }
+                let cycles = self.cpu.step(&mut self.bus) as u64;
+                self.scheduler.add_cycles(cycles);
+
+                // Tick timers and audio
+                self.tick_timers(cycles as u32);
+                self.bus.apu.tick(cycles as u32);
+
+                // Handle pending SWI
+                if let Some(swi_num) = self.cpu.pending_swi.take() {
+                    self.handle_swi(swi_num);
+                }
+
+                // Handle halt request (from HALTCNT write or SWI Halt)
+                if self.bus.halt_requested {
+                    self.bus.halt_requested = false;
+                    self.cpu.halted = true;
+                }
+            }
+
+            // Dispatch pending events
+            while let Some(event) = self.scheduler.pop_if_ready() {
+                self.handle_event(event);
+            }
+        }
+
+        &self.frame_buffer
+    }
+
+    fn handle_event(&mut self, event: Event) {
+        let current_time = self.scheduler.timestamp();
+
+        match event.kind {
+            EventKind::HBlank => {
+                let line = self.bus.io.vcount;
+
+                // Set HBlank flag in DISPSTAT
+                self.bus.io.dispstat |= 0x0002;
+
+                if line < VISIBLE_LINES {
+                    // Render this scanline
+                    self.bus.ppu.render_scanline(
+                        line,
+                        &self.bus.io,
+                        &self.bus.palette,
+                        &self.bus.vram,
+                        &self.bus.oam,
+                        &mut self.frame_buffer,
+                    );
+                }
+
+                // Fire HBlank IRQ if enabled
+                if self.bus.io.dispstat & 0x0010 != 0 {
+                    self.bus.interrupt.request_irq(interrupt::Irq::HBlank);
+                }
+
+                // Trigger HBlank DMA
+                self.run_dma_for_timing(dma::DmaTiming::HBlank);
+
+                // Schedule end of HBlank (start of next scanline)
+                self.scheduler.schedule(Event {
+                    fire_time: current_time + HBLANK_CYCLES as u64,
+                    kind: EventKind::HBlankEnd,
+                });
+            }
+            EventKind::HBlankEnd => {
+                // Clear HBlank flag
+                self.bus.io.dispstat &= !0x0002;
+
+                // Advance to next scanline
+                self.bus.io.vcount = (self.bus.io.vcount + 1) % LINES_PER_FRAME;
+                let line = self.bus.io.vcount;
+
+                // Check VCount match
+                let lyc = (self.bus.io.dispstat >> 8) as u16;
+                if line == lyc {
+                    self.bus.io.dispstat |= 0x0004; // VCount match flag
+                    if self.bus.io.dispstat & 0x0020 != 0 {
+                        self.bus.interrupt.request_irq(interrupt::Irq::VCountMatch);
+                    }
+                } else {
+                    self.bus.io.dispstat &= !0x0004;
+                }
+
+                if line == VISIBLE_LINES {
+                    // VBlank begins
+                    self.bus.io.dispstat |= 0x0001;
+                    if self.bus.io.dispstat & 0x0008 != 0 {
+                        self.bus.interrupt.request_irq(interrupt::Irq::VBlank);
+                    }
+                    // Trigger VBlank DMA
+                    self.run_dma_for_timing(dma::DmaTiming::VBlank);
+                } else if line == 0 {
+                    // VBlank ends, new frame starts
+                    self.bus.io.dispstat &= !0x0001;
+                }
+
+                // Schedule next HBlank
+                self.scheduler.schedule(Event {
+                    fire_time: self.scheduler.timestamp() + HDRAW_CYCLES as u64,
+                    kind: EventKind::HBlank,
+                });
+            }
+            EventKind::TimerOverflow(_id) => {
+                // TODO: Phase 4
+            }
+            EventKind::DmaComplete(_ch) => {
+                // TODO: Phase 4
+            }
+            EventKind::ApuSample => {
+                // TODO: Phase 6
+            }
+            EventKind::ApuFrameSequencer => {
+                // TODO: Phase 6
+            }
+        }
+    }
+
+    /// Tick timers by the given number of CPU cycles.
+    fn tick_timers(&mut self, cycles: u32) {
+        let result = self.bus.timers.tick(cycles);
+
+        // Fire timer IRQs
+        const TIMER_IRQS: [interrupt::Irq; 4] = [
+            interrupt::Irq::Timer0,
+            interrupt::Irq::Timer1,
+            interrupt::Irq::Timer2,
+            interrupt::Irq::Timer3,
+        ];
+        for i in 0..4 {
+            if result.irqs[i] {
+                self.bus.interrupt.request_irq(TIMER_IRQS[i]);
+            }
+        }
+
+        // Timer 0/1 overflow: advance FIFO samples and trigger DMA refill
+        if result.timer0_overflow {
+            let (fifo_a_refill, fifo_b_refill) = self.bus.apu.on_timer_overflow(0);
+            if fifo_a_refill || fifo_b_refill {
+                self.run_dma_for_timing(DmaTiming::Special);
+            }
+        }
+        if result.timer1_overflow {
+            let (fifo_a_refill, fifo_b_refill) = self.bus.apu.on_timer_overflow(1);
+            if fifo_a_refill || fifo_b_refill {
+                self.run_dma_for_timing(DmaTiming::Special);
+            }
+        }
+    }
+
+    /// Run all DMA channels that match a given timing trigger.
+    fn run_dma_for_timing(&mut self, timing: DmaTiming) {
+        let channels = self.bus.dma.channels_for_timing(timing);
+        for ch_id in channels {
+            let (_cycles, irq) = self.bus.run_dma(ch_id);
+            if irq {
+                let irq_type = match ch_id {
+                    0 => interrupt::Irq::Dma0,
+                    1 => interrupt::Irq::Dma1,
+                    2 => interrupt::Irq::Dma2,
+                    3 => interrupt::Irq::Dma3,
+                    _ => continue,
+                };
+                self.bus.interrupt.request_irq(irq_type);
+            }
+        }
+    }
+
+    /// Handle a SWI (software interrupt).
+    /// If no BIOS is loaded, use HLE. Otherwise, jump to the BIOS SWI vector.
+    fn handle_swi(&mut self, swi_num: u8) {
+        if self.bus.has_bios {
+            // Real BIOS: trigger the SWI exception normally
+            self.cpu.software_interrupt(swi_num as u32);
+        } else {
+            // HLE: handle the SWI in Rust
+            bios::handle_swi(&mut self.cpu, &mut self.bus, swi_num);
+        }
+    }
+
+    /// Set the keypad state (active-low: 0 = pressed, 1 = released).
+    pub fn set_keypad_state(&mut self, keys: u16) {
+        self.bus.keypad.set_keys(keys);
+    }
+
+    /// Get a reference to the framebuffer.
+    pub fn framebuffer(&self) -> &[u16] {
+        &self.frame_buffer
+    }
+
+    /// Drain audio samples (interleaved stereo i16) into the output buffer.
+    /// Returns the number of samples written.
+    pub fn drain_audio(&mut self, out: &mut [i16]) -> usize {
+        self.bus.apu.drain_samples(out)
+    }
+
+    /// Serialize the entire emulator state to bytes (for save states).
+    pub fn save_state(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
+    }
+
+    /// Deserialize and restore emulator state from bytes.
+    pub fn load_state(&mut self, data: &[u8]) -> Result<(), bincode::Error> {
+        let state: Gba = bincode::deserialize(data)?;
+        *self = state;
+        Ok(())
+    }
+
+    /// Export raw save data (.sav) from the backup media.
+    pub fn export_save(&self) -> Option<Vec<u8>> {
+        self.bus.backup.to_raw()
+    }
+
+    /// Import raw save data (.sav) into the backup media.
+    pub fn import_save(&mut self, data: &[u8]) {
+        match &mut self.bus.backup {
+            backup::BackupMedia::None => {}
+            backup::BackupMedia::Sram(s) => {
+                let len = data.len().min(s.data.len());
+                s.data[..len].copy_from_slice(&data[..len]);
+            }
+            backup::BackupMedia::Flash(f) => {
+                let len = data.len().min(f.data.len());
+                f.data[..len].copy_from_slice(&data[..len]);
+            }
+            backup::BackupMedia::Eeprom(e) => {
+                let len = data.len().min(e.data.len());
+                e.data[..len].copy_from_slice(&data[..len]);
+            }
+        }
+    }
+
+    /// Step the CPU for N instructions (for testing).
+    pub fn step_n(&mut self, n: usize) {
+        for _ in 0..n {
+            let cycles = self.cpu.step(&mut self.bus) as u64;
+            self.scheduler.add_cycles(cycles);
+            self.tick_timers(cycles as u32);
+            if let Some(swi_num) = self.cpu.pending_swi.take() {
+                self.handle_swi(swi_num);
+            }
+            if self.bus.halt_requested {
+                self.bus.halt_requested = false;
+                self.cpu.halted = true;
+            }
+        }
+    }
+
+    /// Step one instruction AND process any scheduler events that fire.
+    /// Used by tracing diagnostics that need the game to progress normally
+    /// (with HBlank/VBlank/DMA/timer events) while logging each instruction.
+    pub fn step_one(&mut self) {
+        if !self.cpu.halted {
+            let cycles = self.cpu.step(&mut self.bus) as u64;
+            self.scheduler.add_cycles(cycles);
+            self.tick_timers(cycles as u32);
+            if let Some(swi_num) = self.cpu.pending_swi.take() {
+                self.handle_swi(swi_num);
+            }
+            if self.bus.halt_requested {
+                self.bus.halt_requested = false;
+                self.cpu.halted = true;
+            }
+        } else {
+            self.scheduler.add_cycles(1);
+        }
+        // Dispatch any events that have fired
+        while let Some(event) = self.scheduler.pop_if_ready() {
+            self.handle_event(event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal ARM ROM that sets up Mode 3 and writes a pixel.
+    /// This simulates what a real GBA program does on startup.
+    fn make_mode3_test_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x100];
+
+        // ARM instructions at 0x08000000:
+        // Set up Mode 3 display: MOV R0, #0x0403 (DISPCNT = BG2 enable + Mode 3)
+        // Note: we need to write 0x0403 to 0x04000000
+        // Step 1: MOV R0, #0x04000000 (I/O base)
+        // Step 2: MOV R1, #0x0403 (Mode 3 + BG2 enable)
+        // Step 3: STR R1, [R0] (write DISPCNT)
+        // Step 4: MOV R0, #0x06000000 (VRAM base)
+        // Step 5: MOV R1, #0x001F (red in 15-bit: 0x001F = max red)
+        // Step 6: STRH R1, [R0] (write pixel at 0,0)
+        // Step 7: B step7 (infinite loop)
+
+        let instructions: &[u32] = &[
+            // MOV R0, #0x04000000 (0x04 ROR 8, rotate_field=4)
+            0xE3A0_0404,
+            // MOV R1, #0x400 (0x04 ROR 24, rotate_field=0xC)
+            0xE3A0_1C04,
+            // ADD R1, R1, #3 -> R1 = 0x403
+            0xE281_1003,
+            // STRH R1, [R0, #0] — write DISPCNT (16-bit)
+            0xE1C0_10B0,
+            // MOV R0, #0x06000000 (0x06 ROR 8, rotate_field=4)
+            0xE3A0_0406,
+            // MOV R1, #0x1F (red in 15-bit)
+            0xE3A0_101F,
+            // STRH R1, [R0, #0] — pixel (0,0)
+            0xE1C0_10B0,
+            // MOV R1, #0x7C00 (blue: 0x1F ROR 22, rotate_field=0xB)
+            0xE3A0_1B1F,
+            // STRH R1, [R0, #2] — pixel (1,0)
+            // Halfword transfer: offset = hi_nibble[11:8] | lo_nibble[3:0] = 0|2 = 2
+            0xE1C0_10B2,
+            // B . (infinite loop)
+            0xEAFF_FFFE,
+        ];
+
+        for (i, &inst) in instructions.iter().enumerate() {
+            let offset = i * 4;
+            rom[offset..offset + 4].copy_from_slice(&inst.to_le_bytes());
+        }
+
+        rom
+    }
+
+    #[test]
+    fn test_mode3_pixel_write() {
+        let rom = make_mode3_test_rom();
+        let mut gba = Gba::new(None, rom);
+
+        // Skip BIOS — start at ROM entry
+        gba.cpu = arm7tdmi::Cpu::new_skip_bios();
+
+        // Run enough instructions to execute the setup code
+        gba.step_n(20);
+
+        // Verify DISPCNT was written
+        assert_eq!(gba.bus.io.dispcnt, 0x0403, "DISPCNT should be Mode 3 + BG2 enable");
+
+        // Verify VRAM has the pixel data
+        let pixel0 = u16::from_le_bytes([gba.bus.vram[0], gba.bus.vram[1]]);
+        assert_eq!(pixel0, 0x001F, "Pixel (0,0) should be red (0x001F)");
+
+        let pixel1 = u16::from_le_bytes([gba.bus.vram[2], gba.bus.vram[3]]);
+        assert_eq!(pixel1, 0x7C00, "Pixel (1,0) should be blue (0x7C00)");
+    }
+
+    #[test]
+    fn test_mode3_renders_to_framebuffer() {
+        let rom = make_mode3_test_rom();
+        let mut gba = Gba::new(None, rom);
+        gba.cpu = arm7tdmi::Cpu::new_skip_bios();
+
+        // Run one full frame
+        let fb = gba.run_frame();
+
+        // Pixel (0,0) should be red
+        assert_eq!(fb[0], 0x001F, "Framebuffer pixel (0,0) should be red");
+        // Pixel (1,0) should be blue
+        assert_eq!(fb[1], 0x7C00, "Framebuffer pixel (1,0) should be blue");
+    }
+
+    #[test]
+    fn test_vblank_interrupt() {
+        let rom = vec![0u8; 256]; // Empty ROM — CPU will loop on undefined
+        let mut gba = Gba::new(None, rom);
+        gba.cpu = arm7tdmi::Cpu::new_skip_bios();
+
+        // Enable VBlank IRQ in DISPSTAT
+        gba.bus.io.dispstat = 0x0008; // VBlank IRQ enable
+
+        // Enable VBlank in IE
+        gba.bus.interrupt.write_ie(0x0001); // VBlank
+
+        // Run a frame
+        gba.run_frame();
+
+        // After a frame, VCOUNT should have cycled through 0-227
+        // and VBlank IRQ should have been requested
+        assert!(gba.bus.interrupt.read_if() & 1 != 0, "VBlank IRQ should be pending");
+    }
+
+    /// Regression test: pipeline advance used to happen BEFORE execute, making
+    /// branch targets off by 4. Every commercial ROM starts with:
+    ///   B +0x200          ; 0x08000000
+    ///   ...padding...
+    ///   MOV R0, #0x12     ; 0x08000208 — FIQ mode constant
+    ///   MSR CPSR_fc, R0   ; 0x0800020C
+    /// If the pipeline bug were present, R0 would end up 0x1F instead of 0x12.
+    #[test]
+    fn test_branch_then_mov_pipeline() {
+        // Build a ROM with:
+        //   0x08000000: B +0x200 (target = 0x08000208)
+        //   0x08000208: MOV R0, #0x12
+        //   0x0800020C: B . (infinite loop)
+        let mut rom = vec![0u8; 0x300];
+
+        // B +0x200: offset field = (target - (PC+8)) / 4 = (0x208 - 0x8) / 4 = 0x80
+        // Opcode: 0xEA000080
+        let b_instr: u32 = 0xEA00_0080;
+        rom[0..4].copy_from_slice(&b_instr.to_le_bytes());
+
+        // MOV R0, #0x12 at 0x208
+        let mov_instr: u32 = 0xE3A0_0012;
+        rom[0x208..0x20C].copy_from_slice(&mov_instr.to_le_bytes());
+
+        // B . at 0x20C (branch to self): offset = -2 → field = 0xFFFFFE
+        let loop_instr: u32 = 0xEAFF_FFFE;
+        rom[0x20C..0x210].copy_from_slice(&loop_instr.to_le_bytes());
+
+        let mut gba = Gba::new(None, rom);
+        gba.cpu = arm7tdmi::Cpu::new_skip_bios();
+
+        // Step enough to execute: B (step 0) + MOV (step 1)
+        gba.step_n(3);
+
+        // After the MOV executed, R0 should be 0x12 — NOT 0x1F or 0x16 (0x20C word) or other.
+        assert_eq!(gba.cpu.regs[0], 0x12,
+            "R0 should be 0x12 (MOV R0, #0x12 @ 0x08000208); got 0x{:X}. \
+             If this is wrong, pipeline ordering is broken.", gba.cpu.regs[0]);
+
+        // PC should be inside ROM (around 0x0800020C — the B . loop)
+        assert!(gba.cpu.regs[15] >= 0x0800_0000 && gba.cpu.regs[15] < 0x0900_0000,
+            "PC should stay in ROM; got 0x{:08X}", gba.cpu.regs[15]);
+    }
+
+    /// MSR CPSR was being misdecoded as MRS (both share bits[27:20]=0x10 after
+    /// masking bit 21 away). This caused MSR to write CPSR into a register
+    /// instead of updating CPSR. Every ROM's startup does MSR to set mode.
+    #[test]
+    fn test_msr_not_decoded_as_mrs() {
+        // MOV R0, #0x12       ; load FIQ mode constant
+        // MSR CPSR_fc, R0     ; switch to FIQ
+        // B .                  ; loop
+        let mut rom = vec![0u8; 0x100];
+        let mov: u32 = 0xE3A0_0012;
+        let msr: u32 = 0xE129_F000;
+        let loop_: u32 = 0xEAFF_FFFE;
+        rom[0..4].copy_from_slice(&mov.to_le_bytes());
+        rom[4..8].copy_from_slice(&msr.to_le_bytes());
+        rom[8..12].copy_from_slice(&loop_.to_le_bytes());
+
+        let mut gba = Gba::new(None, rom);
+        gba.cpu = arm7tdmi::Cpu::new_skip_bios();
+        gba.step_n(2);
+
+        // After MSR, mode should be FIQ (0x12)
+        assert_eq!(gba.cpu.cpsr.mode() as u32, 0x12,
+            "MSR should have switched to FIQ mode (0x12); got mode=0x{:X}",
+            gba.cpu.cpsr.mode() as u32);
+
+        // R0 should still be 0x12 (MSR doesn't modify R0)
+        assert_eq!(gba.cpu.regs[0], 0x12,
+            "R0 should still be 0x12; got 0x{:X}", gba.cpu.regs[0]);
+
+        // PC should NOT be 0x1F — that was the MRS-writes-to-PC bug symptom
+        assert_ne!(gba.cpu.regs[15], 0x1F,
+            "PC should not equal CPSR value (indicates MSR decoded as MRS with Rd=PC)");
+    }
+
+    /// Pipeline invariant: during ARM execute, regs[15] must equal
+    /// the executing instruction's address + 8 (per ARM7TDMI spec).
+    #[test]
+    fn test_arm_pc_read_during_execute() {
+        // MOV R0, PC at 0x08000000
+        // Expected: R0 = 0x08000008 (address of MOV + 8)
+        let mut rom = vec![0u8; 0x100];
+        let mov_pc: u32 = 0xE1A0_000F; // MOV R0, R15
+        rom[0..4].copy_from_slice(&mov_pc.to_le_bytes());
+        // Follow with B . at 0x04 (offset = -2 field)
+        let loop_instr: u32 = 0xEAFF_FFFE;
+        rom[4..8].copy_from_slice(&loop_instr.to_le_bytes());
+
+        let mut gba = Gba::new(None, rom);
+        gba.cpu = arm7tdmi::Cpu::new_skip_bios();
+        gba.step_n(1);
+
+        assert_eq!(gba.cpu.regs[0], 0x0800_0008,
+            "R0 should read PC as 0x08000008 (instruction_addr + 8); got 0x{:08X}",
+            gba.cpu.regs[0]);
+    }
+}

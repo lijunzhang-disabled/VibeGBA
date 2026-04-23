@@ -1,0 +1,21 @@
+# Build artifacts
+/target
+
+# User-supplied content
+test-roms/*.gba
+test-roms/*.bin
+
+# Per-ROM save data and save states (next to the ROM file)
+*.sav
+*.state
+
+# Diagnostic output dumps (created on demand in /tmp)
+*.ppm
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+
+# Claude Code local settings (per-machine permissions, etc.)
+.claude/settings.local.json

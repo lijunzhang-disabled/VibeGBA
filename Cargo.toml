@@ -1,0 +1,3 @@
+[workspace]
+members = ["gba-core", "gba-frontend"]
+resolver = "2"
