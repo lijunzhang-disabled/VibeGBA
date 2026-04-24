@@ -61,10 +61,34 @@ Our FIFO DMA correctly advances `internal_sad` across timer triggers
 Pokémon's case, nothing ever resets `internal_sad`, so it drifts
 through the entire IWRAM mirror space, reading garbage.
 
-On real hardware, either the BIOS IRQ-handling path or some subtle
-DMA behaviour we haven't pinned down must be resetting
-`internal_sad` back to `sad` at VBlank. Without that, real Pokémon
-audio would be broken too — and it isn't.
+On real hardware, the canonical mechanism is documented in GBATEK:
+
+> **SoundDriverVSync (SWI 1Dh):** "An extremely short system call that
+> resets the sound DMA. The timing is extremely critical, so call this
+> function immediately after the V-Blank interrupt every 1/60 second."
+
+So on real hardware the BIOS function `SoundDriverVSync` is what resets
+the DMA each VBlank. Games that use the BIOS sound driver call it
+explicitly; games that roll their own M4A typically inline equivalent
+code into their own IRQ handler (toggle DMAxCNT_H enable to force a
+re-latch).
+
+Pokémon Emerald does **neither** visibly in our emulator — our SWI
+trace caught zero sound SWIs and our DMA-register-write trace caught
+zero control/SAD writes after boot. The game's in-ROM IRQ handler at
+IWRAM `0x03002750` evidently contains the equivalent code but we
+never observe it running the DMA-write section. Possibilities:
+- A CPU bug we haven't found causes the handler to early-return before
+  the DMA-rewrite code.
+- The game uses an indirect path (function pointer table, computed
+  jump) that skips the DMA-rewrite branch in our emulator state.
+- There's a pre-VBlank check we're failing that causes M4A to
+  short-circuit.
+
+What we know empirically: forcing the re-anchor at VBlank (matching
+what SWI 0x1D does) makes audio work. This is the right shape of
+fix; identifying *why* Pokémon's own code doesn't drive it is a
+follow-up.
 
 ## Fix (behavioural)
 
@@ -99,13 +123,12 @@ samples to a buffer that DMA has already moved past.
 
 ## Follow-ups
 
-- [ ] Figure out the *real* mechanism. Candidates: (a) Pokémon's IRQ
-  handler does disable/enable via some indirect code path we haven't
-  decoded; (b) real hardware's DMA controller has an
-  implementation-defined behaviour (e.g. when FIFO goes from full to
-  empty) that effectively resets `internal_sad`; (c) the BIOS IRQ
-  stub on real GBA does implicit DMA work before jumping to the user
-  handler — and our HLE stub doesn't.
+- [ ] Figure out why Pokémon's own IRQ handler isn't driving the DMA
+  reset in our emulator. GBATEK documents SWI 0x1D as the canonical
+  way ("resets the sound DMA… call immediately after V-Blank"), and
+  Pokémon's M4A build inlines equivalent code — but our DMA-write
+  trace shows the inlined code never runs. Probably a CPU/memory
+  accuracy bug along a specific path our test ROMs don't exercise.
 - [ ] Investigate remaining "minor background noise" — likely mixer
   scaling or oversampling-related, not CPU.
 - [ ] Confirm this fix doesn't break other games (e.g. ones that DO
