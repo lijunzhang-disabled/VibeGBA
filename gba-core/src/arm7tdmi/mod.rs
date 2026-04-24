@@ -427,6 +427,71 @@ impl Cpu {
         }
     }
 
+    /// Read a register as seen by User/System mode, regardless of current mode.
+    /// Used by LDM/STM with S bit (when R15 is not in the rlist — the "^" suffix).
+    pub fn read_user_reg(&self, r: u8) -> u32 {
+        let r = r as usize & 0xF;
+        let mode = self.cpsr.mode();
+        match r {
+            0..=7 | 15 => self.regs[r],
+            8..=12 => {
+                if mode == CpuMode::Fiq {
+                    self.banked.usr_r8_r12[r - 8]
+                } else {
+                    self.regs[r]
+                }
+            }
+            13 => {
+                if mode.bank_index() == 0 {
+                    self.regs[13]
+                } else {
+                    self.banked.sp[0]
+                }
+            }
+            14 => {
+                if mode.bank_index() == 0 {
+                    self.regs[14]
+                } else {
+                    self.banked.lr[0]
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Write a register as seen by User/System mode, regardless of current mode.
+    /// Used by LDM with S bit loading into user-mode registers.
+    pub fn write_user_reg(&mut self, r: u8, val: u32) {
+        let r = r as usize & 0xF;
+        let mode = self.cpsr.mode();
+        match r {
+            0..=7 => self.regs[r] = val,
+            15 => self.regs[r] = val,
+            8..=12 => {
+                if mode == CpuMode::Fiq {
+                    self.banked.usr_r8_r12[r - 8] = val;
+                } else {
+                    self.regs[r] = val;
+                }
+            }
+            13 => {
+                if mode.bank_index() == 0 {
+                    self.regs[13] = val;
+                } else {
+                    self.banked.sp[0] = val;
+                }
+            }
+            14 => {
+                if mode.bank_index() == 0 {
+                    self.regs[14] = val;
+                } else {
+                    self.banked.lr[0] = val;
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// Write to a register without triggering a branch (used in data processing
     /// when S bit is set and Rd=R15 to restore CPSR from SPSR).
     pub fn set_reg_with_flags(&mut self, r: u8, val: u32, s: bool) {

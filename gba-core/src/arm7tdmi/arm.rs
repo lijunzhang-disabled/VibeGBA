@@ -414,7 +414,9 @@ impl Cpu {
             bus.write16(addr & !1, val as u16);
         }
 
-        if !p || w {
+        // Same Rn==Rd writeback rule as LDR: on load, the loaded value wins
+        // over the writeback, so skip writeback when l && rn == rd.
+        if (!p || w) && !(l && rn == rd) {
             if rn != 15 {
                 self.regs[rn as usize] = offset_addr;
             }
@@ -438,13 +440,24 @@ impl Cpu {
         let reg_count = rlist.count_ones();
 
         if rlist == 0 {
-            // Empty register list: ARM7TDMI quirk
-            // Transfers R15 and adds/subtracts 0x40
+            // Empty rlist: R15 is transferred, writeback is ±0x40.
+            // The transfer address follows the normal LDM/STM addressing modes
+            // as if 16 registers were in the list:
+            //   IA (U=1,P=0): addr = base       → writeback base+0x40
+            //   IB (U=1,P=1): addr = base+4     → writeback base+0x40
+            //   DA (U=0,P=0): addr = base-0x3C  → writeback base-0x40
+            //   DB (U=0,P=1): addr = base-0x40  → writeback base-0x40
+            let xfer_addr = match (u, p) {
+                (true,  false) => base,
+                (true,  true)  => base.wrapping_add(4),
+                (false, false) => base.wrapping_sub(0x3C),
+                (false, true)  => base.wrapping_sub(0x40),
+            };
             if l {
-                let val = bus.read32(base);
-                self.branch(val);
+                let val = bus.read32(xfer_addr);
+                self.branch(val & !1);
             } else {
-                bus.write32(base, self.reg(15).wrapping_add(4));
+                bus.write32(xfer_addr, self.reg(15).wrapping_add(4));
             }
             if w {
                 self.regs[rn as usize] = if u {
@@ -475,6 +488,18 @@ impl Cpu {
             base.wrapping_sub(reg_count * 4)
         };
 
+        // S bit meaning:
+        //   LDM + S + R15 in rlist   → load normally, then CPSR = SPSR (exception return)
+        //   LDM + S + R15 NOT in list → load into USER-bank registers (user-mode LDM)
+        //   STM + S                   → store USER-bank registers (R15 in list is UNPREDICTABLE)
+        let r15_in_list = rlist & (1 << 15) != 0;
+        let use_user_bank = s && !(l && r15_in_list);
+
+        // STM base-in-list quirk: if rn is in rlist and NOT the lowest-numbered
+        // register, the post-writeback value is stored (not the original).
+        let rn_in_list = rlist & (1 << rn) != 0;
+        let rn_is_lowest = rn_in_list && rlist.trailing_zeros() as u8 == rn;
+
         // Transfer registers in order R0-R15
         for i in 0..16u8 {
             if rlist & (1 << i) == 0 {
@@ -483,8 +508,8 @@ impl Cpu {
 
             if l {
                 let val = bus.read32(addr & !3);
-                if s && (rlist & (1 << 15)) != 0 {
-                    // LDM with S bit and R15 in list: restore CPSR from SPSR
+                if s && r15_in_list {
+                    // LDM with S bit and R15 in list: load, then restore CPSR on R15
                     if i == 15 {
                         let spsr = self.spsr();
                         let new_mode = spsr.mode();
@@ -496,14 +521,19 @@ impl Cpu {
                     }
                 } else if i == 15 {
                     self.branch(val & !1);
+                } else if use_user_bank {
+                    self.write_user_reg(i, val);
                 } else {
-                    // S bit without R15: access user-mode registers
-                    // (simplified: just use current mode registers for now)
                     self.regs[i as usize] = val;
                 }
             } else {
                 let val = if i == 15 {
                     self.reg(15).wrapping_add(4)
+                } else if i == rn && rn_in_list && !rn_is_lowest && w {
+                    // Base-in-list, not-lowest, with writeback: store final value.
+                    final_addr
+                } else if use_user_bank {
+                    self.read_user_reg(i)
                 } else {
                     self.reg(i)
                 };
@@ -513,7 +543,9 @@ impl Cpu {
             addr = addr.wrapping_add(4);
         }
 
-        if w {
+        // Writeback: skip if this is an LDM and Rn is in the rlist — the loaded
+        // value wins (ARM7TDMI behavior).
+        if w && !(l && rlist & (1 << rn) != 0) {
             self.regs[rn as usize] = final_addr;
         }
 

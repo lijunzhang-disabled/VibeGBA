@@ -456,15 +456,9 @@ impl Cpu {
         let addr = self.reg(rb).wrapping_add(offset);
 
         if l {
-            // Format 10 LDRH: offset is always even, so a misaligned address
-            // can only come from an odd base register. Pokemon's M4A sound
-            // driver triggers a code path where adding the fix here causes a
-            // downstream crash we haven't root-caused yet. For now, keep the
-            // aligned-only behavior here; the rotation fix is applied in
-            // format 7/8 (register-offset) LDRH which covers the common case.
-            // TODO(phase9): investigate the format 10 interaction. See
-            // debug/2026-04-24_pokemon-emerald-noisy-audio.md follow-ups.
-            self.regs[rd as usize] = bus.read16(addr & !1) as u32;
+            // LDRH with misaligned address: aligned read, rotate right by 8.
+            let val = bus.read16(addr & !1) as u32;
+            self.regs[rd as usize] = if addr & 1 != 0 { val.rotate_right(8) } else { val };
         } else {
             bus.write16(addr & !1, self.reg(rd) as u16);
         }
@@ -562,8 +556,10 @@ impl Cpu {
         if pc {
             let val = bus.read32(addr);
             addr = addr.wrapping_add(4);
-            // ARM7TDMI: BX behavior based on bit 0
-            self.branch_exchange(val);
+            // ARMv4T (GBA): POP {..., PC} stays in THUMB, does NOT interwork.
+            // Loaded value must be halfword-aligned; bit 0 is masked off.
+            // (Interworking via loaded PC is an ARMv5T+ feature.)
+            self.branch(val & !1);
         }
 
         self.regs[13] = addr;
@@ -577,11 +573,31 @@ impl Cpu {
     fn thumb_stmia(&mut self, bus: &mut Bus, opcode: u16) -> u32 {
         let rb = ((opcode >> 8) & 7) as u8;
         let rlist = opcode & 0xFF;
-        let mut addr = self.reg(rb);
+        let base = self.reg(rb);
+        let mut addr = base;
+
+        if rlist == 0 {
+            // ARM7TDMI quirk: empty rlist stores PC+4 at [Rb], writeback Rb += 0x40.
+            bus.write32(addr, self.reg(15).wrapping_add(2));
+            self.regs[rb as usize] = base.wrapping_add(0x40);
+            return 2;
+        }
+
+        // ARM7TDMI quirk: if Rb is in rlist and NOT the lowest-numbered
+        // register, STM writes the post-writeback value of Rb (not the
+        // original). If Rb IS the lowest, the original value is stored.
+        let rb_in_list = rlist & (1 << rb) != 0;
+        let rb_is_lowest = rb_in_list && (rlist & ((1 << rb) - 1)) == 0;
+        let final_addr = base.wrapping_add(rlist.count_ones() * 4);
 
         for i in 0..8u8 {
             if rlist & (1 << i) != 0 {
-                bus.write32(addr, self.reg(i));
+                let val = if i == rb && rb_in_list && !rb_is_lowest {
+                    final_addr
+                } else {
+                    self.reg(i)
+                };
+                bus.write32(addr, val);
                 addr = addr.wrapping_add(4);
             }
         }
@@ -594,7 +610,16 @@ impl Cpu {
     fn thumb_ldmia(&mut self, bus: &mut Bus, opcode: u16) -> u32 {
         let rb = ((opcode >> 8) & 7) as u8;
         let rlist = opcode & 0xFF;
-        let mut addr = self.reg(rb);
+        let base = self.reg(rb);
+        let mut addr = base;
+
+        if rlist == 0 {
+            // ARM7TDMI quirk: empty rlist loads PC from [Rb], writeback Rb += 0x40.
+            let val = bus.read32(addr);
+            self.regs[rb as usize] = base.wrapping_add(0x40);
+            self.branch(val & !1);
+            return 5;
+        }
 
         for i in 0..8u8 {
             if rlist & (1 << i) != 0 {
