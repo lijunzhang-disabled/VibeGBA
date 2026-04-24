@@ -53,12 +53,30 @@ pub fn handle_swi(cpu: &mut Cpu, bus: &mut Bus, comment: u8) -> bool {
         0x13 => swi_huffman_uncomp(cpu, bus),
         0x14 => swi_rl_uncomp_wram(cpu, bus),
         0x15 => swi_rl_uncomp_vram(cpu, bus),
+        0x1D => swi_sound_driver_vsync(bus),
         _ => {
             log::warn!("Unhandled SWI 0x{:02X}", comment);
             return false;
         }
     }
     true
+}
+
+// ─── SWI 0x1D: SoundDriverVSync ──────────────────────────────────
+//
+// Must be called every VBlank. Re-anchors DMA1/DMA2 for FIFO sound
+// by disabling them (stops the advancing internal source) and
+// re-enabling them, which re-latches internal_sad from the
+// user-programmed SAD register. Without this call, DMA1/DMA2 drift
+// through memory indefinitely and read garbage instead of the
+// M4A sample buffer.
+fn swi_sound_driver_vsync(bus: &mut Bus) {
+    for ch in [1usize, 2usize] {
+        let ctl = bus.dma.channels[ch].control;
+        // Clear enable bit then restore it → forces 0→1 re-latch.
+        bus.write_dma_control(ch, ctl & !(1 << 15));
+        bus.write_dma_control(ch, ctl);
+    }
 }
 
 // ─── SWI 0x00: SoftReset ─────────────────────────────────────────

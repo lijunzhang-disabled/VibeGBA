@@ -13,6 +13,7 @@ This folder stores two kinds of documents:
 | 2026-04-24 | [Pokémon Emerald noisy audio: sound engine producing garbage](2026-04-24_pokemon-emerald-noisy-audio.md) | **Open** (root cause identified) |
 | 2026-04-24 | [ARM MSR: mode-bit banking was silently skipped](2026-04-24_arm-msr-banking.md) | **Fixed** |
 | 2026-04-24 | [CPU accuracy sweep — 5 fixes from jsmolka test ROMs](2026-04-24_cpu-accuracy-sweep.md) | **In progress** |
+| 2026-04-25 | [Pokémon audio: FIFO DMA must be re-anchored every VBlank](2026-04-25_pokemon-audio-dma-reanchor.md) | **Fixed** (behavioural) |
 
 ## Concept notes
 

@@ -41,6 +41,10 @@ pub struct Gba {
     pub scheduler: Scheduler,
     /// 240x160 framebuffer, 15-bit RGB (xBBBBBGGGGGRRRRR)
     frame_buffer: Vec<u16>,
+    /// Debug: total VBlank entries (line == 160 transitions) observed.
+    pub vblank_entries: u64,
+    /// Debug: total VBlank IRQ requests raised to the interrupt controller.
+    pub vblank_irqs_raised: u64,
 }
 
 impl Gba {
@@ -61,6 +65,8 @@ impl Gba {
             bus,
             scheduler,
             frame_buffer: vec![0u16; SCREEN_WIDTH * SCREEN_HEIGHT],
+            vblank_entries: 0,
+            vblank_irqs_raised: 0,
         }
     }
 
@@ -170,11 +176,29 @@ impl Gba {
                 if line == VISIBLE_LINES {
                     // VBlank begins
                     self.bus.io.dispstat |= 0x0001;
+                    self.vblank_entries += 1;
                     if self.bus.io.dispstat & 0x0008 != 0 {
                         self.bus.interrupt.request_irq(interrupt::Irq::VBlank);
+                        self.vblank_irqs_raised += 1;
                     }
                     // Trigger VBlank DMA
                     self.run_dma_for_timing(dma::DmaTiming::VBlank);
+                    // Re-anchor FIFO DMA source on every VBlank. M4A-based
+                    // games (Pokémon, etc.) write fresh samples to a fixed
+                    // buffer each vblank and expect DMA to keep reading
+                    // from the start of that buffer rather than drifting
+                    // forward indefinitely. On real hardware this reset
+                    // is typically done by the BIOS sound driver or the
+                    // game's own in-ROM IRQ handler; we guarantee it here
+                    // so that games which assume the behaviour but don't
+                    // explicitly call SWI 0x1D still work.
+                    // See debug/2026-04-25_pokemon-audio-dma-reanchor.md
+                    for ch in [1usize, 2] {
+                        let c = &mut self.bus.dma.channels[ch];
+                        if c.active && matches!(c.timing(), dma::DmaTiming::Special) {
+                            c.internal_sad = c.sad & 0x07FF_FFFF;
+                        }
+                    }
                 } else if line == 0 {
                     // VBlank ends, new frame starts
                     self.bus.io.dispstat &= !0x0001;

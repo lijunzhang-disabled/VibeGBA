@@ -131,6 +131,9 @@ pub struct Cpu {
     pipeline: [u32; 2],
     /// Whether the pipeline needs to be refilled (after branch).
     pub pipeline_flushed: bool,
+    /// Debug: count of interrupt-handler entries.
+    #[serde(default)]
+    pub irq_entries: u64,
     /// CPU is halted (waiting for interrupt).
     pub halted: bool,
     /// Pending SWI comment (set by SWI instruction, consumed by Gba::step).
@@ -145,6 +148,7 @@ impl Cpu {
             banked: BankedRegisters::new(),
             pipeline: [0; 2],
             pipeline_flushed: true,
+            irq_entries: 0,
             halted: false,
             pending_swi: None,
         };
@@ -174,6 +178,7 @@ impl Cpu {
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
         // Check for pending interrupts
         if bus.interrupt.has_pending() && !self.cpsr.irq_disabled() {
+            self.irq_entries += 1;
             self.handle_interrupt(bus);
             self.halted = false;
         }
