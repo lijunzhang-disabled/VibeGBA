@@ -339,10 +339,11 @@ SDL2 audio callback (~60x per second):
 - Full CLI debugger with `step`/`break`/`continue`/`watch`
 - GDB RSP remote debugging
 
-### Phase 9: Accuracy Polish [TODO]
+### Phase 9: Accuracy Polish [IN PROGRESS]
 
 **Goal**: Maximize game compatibility.
 
+**General:**
 - Wait states (WAITCNT: WS0/WS1/WS2 sequential/non-sequential timing)
 - Game Pak prefetch buffer
 - Open bus behavior, BIOS read protection
@@ -350,6 +351,39 @@ SDL2 audio callback (~60x per second):
 - Forced blank, HBlank interval free
 - Sprite edge cases (priority quirks, semi-transparent + window interaction)
 - Broad game testing and fixes
+
+**BIOS HLE — incomplete (22 of ~40 SWIs implemented):**
+
+Currently missing SWIs (games that use them won't work correctly without a real BIOS dump):
+
+| SWI  | Name | Purpose |
+|---|---|---|
+| 0x19 | SoundBias | Sets audio output bias level |
+| 0x1A | SoundDriverInit | Initializes the M4A sound driver |
+| 0x1B | SoundDriverMode | Sets sound mixer mode |
+| 0x1C | SoundDriverMain | Main mixer tick (per frame) |
+| 0x1D | SoundDriverVSync | VBlank sync for audio |
+| 0x1E | SoundChannelClear | Clears all sound channels |
+| 0x1F | MidiKey2Freq | Converts MIDI note to GBA frequency register value |
+| 0x20 | MusicPlayerOpen | Open music player slot |
+| 0x21 | MusicPlayerStart | Start music playback |
+| 0x22 | MusicPlayerStop | Stop music |
+| 0x23 | MusicPlayerContinue | Resume music |
+| 0x24 | MusicPlayerFadeOut | Fade out music |
+| 0x25 | MultiBoot | Multi-boot (GBA-to-GBA transfer) |
+| 0x26 | HardReset | Full reset (undocumented) |
+| 0x27 | CustomHalt | Extended halt (undocumented) |
+| 0x28 | SoundDriverVSyncOff | Pause sound VSync |
+| 0x29 | SoundDriverVSyncOn | Resume sound VSync |
+| 0x2A | GetJumpList | Return jump table (undocumented) |
+
+Implementation note: SWIs that are unhandled currently just log a warning and return. Games that rely on them (likely most commercial titles using BIOS audio) will silently fail audio or other features.
+
+Workaround: load a real GBA BIOS dump via `--bios gba_bios.bin`. Pokémon Emerald specifically does NOT use the BIOS sound SWIs — it ships its own sound driver — so a real BIOS won't fix Emerald audio (that's a separate CPU emulation issue, documented in `debug/2026-04-24_pokemon-emerald-noisy-audio.md`).
+
+**Known game-specific issues** (tracked in `debug/` folder):
+- Pokémon Emerald audio sounds like noise — sound engine bug, root cause in CPU emulation
+- Pokémon Emerald RTC — **fixed** via S-3511 HLE in `rtc.rs`
 
 **Milestone**: High compatibility across 50+ commercial titles.
 

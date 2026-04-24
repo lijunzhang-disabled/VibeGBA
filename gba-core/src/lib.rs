@@ -8,6 +8,7 @@ pub mod dma;
 pub mod timer;
 pub mod interrupt;
 pub mod keypad;
+pub mod rtc;
 pub mod scheduler;
 
 use arm7tdmi::Cpu;
@@ -66,17 +67,23 @@ impl Gba {
     /// Run the emulator for one full frame (~280896 cycles).
     /// Returns a reference to the 240x160 framebuffer.
     pub fn run_frame(&mut self) -> &[u16] {
-        let frame_end = self.scheduler.timestamp() + CYCLES_PER_FRAME;
+        self.run_cycles(CYCLES_PER_FRAME);
+        &self.frame_buffer
+    }
 
-        while self.scheduler.timestamp() < frame_end {
-            let next_event_time = self.scheduler.peek_time().unwrap_or(frame_end);
-            let target = next_event_time.min(frame_end);
+    /// Run the emulator for `cycles` CPU cycles. Used by audio-synced frontends
+    /// that want to pump audio samples at a finer granularity than a full frame.
+    pub fn run_cycles(&mut self, cycles: u64) {
+        let target_time = self.scheduler.timestamp() + cycles;
 
-            // Step CPU until next event
-            while self.scheduler.timestamp() < target {
+        while self.scheduler.timestamp() < target_time {
+            let next_event_time = self.scheduler.peek_time().unwrap_or(target_time);
+            let step_target = next_event_time.min(target_time);
+
+            // Step CPU until next event or chunk end
+            while self.scheduler.timestamp() < step_target {
                 if self.cpu.halted {
-                    // Fast-forward to the next event
-                    self.scheduler.advance_to(target);
+                    self.scheduler.advance_to(step_target);
                     break;
                 }
                 let cycles = self.cpu.step(&mut self.bus) as u64;
@@ -103,8 +110,6 @@ impl Gba {
                 self.handle_event(event);
             }
         }
-
-        &self.frame_buffer
     }
 
     fn handle_event(&mut self, event: Event) {

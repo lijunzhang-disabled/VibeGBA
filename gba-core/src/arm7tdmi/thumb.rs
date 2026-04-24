@@ -390,7 +390,8 @@ impl Cpu {
                 self.regs[rd as usize] = val.rotate_right(rotation);
             }
             0b101 => { // LDRH Rd, [Rb, Ro]
-                self.regs[rd as usize] = bus.read16(addr & !1) as u32;
+                let val = bus.read16(addr & !1) as u32;
+                self.regs[rd as usize] = if addr & 1 != 0 { val.rotate_right(8) } else { val };
             }
             0b110 => { // LDRB Rd, [Rb, Ro]
                 self.regs[rd as usize] = bus.read8(addr) as u32;
@@ -455,6 +456,14 @@ impl Cpu {
         let addr = self.reg(rb).wrapping_add(offset);
 
         if l {
+            // Format 10 LDRH: offset is always even, so a misaligned address
+            // can only come from an odd base register. Pokemon's M4A sound
+            // driver triggers a code path where adding the fix here causes a
+            // downstream crash we haven't root-caused yet. For now, keep the
+            // aligned-only behavior here; the rotation fix is applied in
+            // format 7/8 (register-offset) LDRH which covers the common case.
+            // TODO(phase9): investigate the format 10 interaction. See
+            // debug/2026-04-24_pokemon-emerald-noisy-audio.md follow-ups.
             self.regs[rd as usize] = bus.read16(addr & !1) as u32;
         } else {
             bus.write16(addr & !1, self.reg(rd) as u16);

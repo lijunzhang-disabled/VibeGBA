@@ -8,6 +8,22 @@
 //!   THUMB mode: SWI #nn -> comment = nn (bits 7:0)
 //!
 //! Parameters are passed in R0-R3, results returned in R0-R3.
+//!
+//! ## Coverage
+//!
+//! We HLE 22 of ~40 GBA BIOS SWIs. The missing ones are mostly sound-related
+//! (SWI 0x19-0x1F), music player (0x20-0x24), MultiBoot (0x25), and a handful
+//! of undocumented/rarely-used calls (0x26-0x2A).
+//!
+//! Missing SWIs just log a warning and do nothing. Games that rely on BIOS
+//! sound functions will silently have broken audio. Workaround: load a real
+//! BIOS dump with `Gba::new(Some(bios), rom)`.
+//!
+//! Note: Pokémon Ruby/Sapphire/Emerald ship their own M4A sound driver in
+//! ROM and do NOT call the BIOS sound SWIs — so a missing 0x1A-0x1F is not
+//! the cause of their audio issues.
+//!
+//! See `PLAN.md` Phase 9 for the full list of missing SWIs.
 
 use crate::arm7tdmi::Cpu;
 use crate::bus::Bus;

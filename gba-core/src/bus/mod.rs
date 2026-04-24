@@ -6,6 +6,7 @@ use crate::dma::DmaController;
 use crate::interrupt::InterruptController;
 use crate::keypad::Keypad;
 use crate::ppu::Ppu;
+use crate::rtc::Rtc;
 use crate::timer::Timers;
 use io_regs::IoRegisters;
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ pub struct Bus {
     /// 256KB external work RAM (16-bit bus, 3-cycle access)
     ewram: Vec<u8>,
     /// 32KB internal work RAM (32-bit bus, 1-cycle access)
-    iwram: Vec<u8>,
+    pub(crate) iwram: Vec<u8>,
     /// I/O registers
     pub io: IoRegisters,
     /// PPU state
@@ -42,6 +43,8 @@ pub struct Bus {
     pub interrupt: InterruptController,
     /// Keypad
     pub keypad: Keypad,
+    /// Cartridge RTC (Pokémon gen 3 etc.)
+    pub rtc: Rtc,
     /// Open bus: last value read (for unmapped reads)
     last_read: u32,
     /// BIOS open bus latch (protects BIOS memory)
@@ -57,6 +60,8 @@ impl Bus {
         let has_bios = bios.is_some();
         let bios_data = bios.unwrap_or_else(|| make_hle_bios());
         let backup = backup::detect_backup_type(&rom);
+        let mut rtc = Rtc::new();
+        rtc.enabled = Rtc::detect(&rom);
 
         Bus {
             bios: bios_data,
@@ -74,6 +79,7 @@ impl Bus {
             timers: Timers::new(),
             interrupt: InterruptController::new(),
             keypad: Keypad::new(),
+            rtc,
             last_read: 0,
             bios_latch: 0,
             has_bios,
@@ -232,6 +238,29 @@ impl Bus {
             }
             // 8-bit OAM writes are ignored
             0x07 => {}
+            0x08..=0x0D => {
+                // GPIO byte writes — forward to RTC. Games rarely write 8-bit to GPIO
+                // but we handle it by reading the current 16-bit value and merging.
+                if self.rtc.enabled {
+                    let rel = addr & 0x01FF_FFFF;
+                    let reg_addr = rel & !1;
+                    let reg_off = match reg_addr {
+                        0xC4 => Some(0u32),
+                        0xC6 => Some(2),
+                        0xC8 => Some(4),
+                        _ => None,
+                    };
+                    if let Some(off) = reg_off {
+                        let cur = self.rtc.read_reg(off);
+                        let new = if rel & 1 == 0 {
+                            (cur & 0xFF00) | val as u16
+                        } else {
+                            (cur & 0x00FF) | ((val as u16) << 8)
+                        };
+                        self.rtc.write_reg(off, new);
+                    }
+                }
+            }
             0x0E..=0x0F => self.backup.write(addr & 0xFFFF, val),
             _ => {}
         }
@@ -270,6 +299,18 @@ impl Bus {
                 let base = (addr & 0x3FF) as usize;
                 self.oam[base] = bytes[0];
                 self.oam[base + 1] = bytes[1];
+            }
+            0x08..=0x0D => {
+                // Cartridge writes — only handled for GPIO (RTC) registers.
+                if self.rtc.enabled {
+                    let rel = addr & 0x01FF_FFFE;
+                    match rel {
+                        0xC4 => self.rtc.write_reg(0, val),
+                        0xC6 => self.rtc.write_reg(2, val),
+                        0xC8 => self.rtc.write_reg(4, val),
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }
@@ -313,6 +354,10 @@ impl Bus {
             }
         }
     }
+
+    pub fn iwram_ref(&self) -> &[u8] { &self.iwram }
+    pub fn iwram_mut(&mut self) -> &mut [u8] { &mut self.iwram }
+    pub fn ewram_ref(&self) -> &[u8] { &self.ewram }
 
     // ─── DMA execution ─────────────────────────────────────────────
 
@@ -441,6 +486,17 @@ impl Bus {
     }
 
     fn read_rom8(&self, addr: u32) -> u8 {
+        // GPIO registers for cartridges with RTC etc. (0x080000C4..0x080000C8)
+        if self.rtc.enabled {
+            let rel = addr & 0x01FF_FFFF;
+            if rel == 0xC4 { return self.rtc.read_reg(0) as u8; }
+            if rel == 0xC5 { return (self.rtc.read_reg(0) >> 8) as u8; }
+            if rel == 0xC6 { return self.rtc.read_reg(2) as u8; }
+            if rel == 0xC7 { return (self.rtc.read_reg(2) >> 8) as u8; }
+            if rel == 0xC8 { return self.rtc.read_reg(4) as u8; }
+            if rel == 0xC9 { return (self.rtc.read_reg(4) >> 8) as u8; }
+        }
+
         let offset = (addr & 0x01FF_FFFF) as usize;
         if offset < self.rom.len() {
             self.rom[offset]
@@ -451,6 +507,14 @@ impl Bus {
     }
 
     fn read_rom16(&self, addr: u32) -> u16 {
+        // GPIO registers (halfword reads)
+        if self.rtc.enabled {
+            let rel = addr & 0x01FF_FFFE;
+            if rel == 0xC4 { return self.rtc.read_reg(0); }
+            if rel == 0xC6 { return self.rtc.read_reg(2); }
+            if rel == 0xC8 { return self.rtc.read_reg(4); }
+        }
+
         let offset = (addr & 0x01FF_FFFE) as usize;
         if offset + 1 < self.rom.len() {
             u16::from_le_bytes([self.rom[offset], self.rom[offset + 1]])

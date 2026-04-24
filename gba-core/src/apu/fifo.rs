@@ -58,11 +58,23 @@ impl FifoChannel {
     pub fn write32(&mut self, value: u32) {
         let bytes = value.to_le_bytes();
         for &byte in &bytes {
-            if self.count < FIFO_CAPACITY {
-                self.buffer[self.write_pos] = byte as i8;
-                self.write_pos = (self.write_pos + 1) % FIFO_CAPACITY;
-                self.count += 1;
-            }
+            self.push_byte(byte as i8);
+        }
+    }
+
+    /// Write a 16-bit value (2 samples) into the FIFO.
+    /// Called when CPU does 16-bit writes to FIFO (e.g., from a split 32-bit bus write).
+    pub fn write16(&mut self, value: u16) {
+        let bytes = value.to_le_bytes();
+        self.push_byte(bytes[0] as i8);
+        self.push_byte(bytes[1] as i8);
+    }
+
+    fn push_byte(&mut self, sample: i8) {
+        if self.count < FIFO_CAPACITY {
+            self.buffer[self.write_pos] = sample;
+            self.write_pos = (self.write_pos + 1) % FIFO_CAPACITY;
+            self.count += 1;
         }
     }
 

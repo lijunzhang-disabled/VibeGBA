@@ -8,8 +8,15 @@ pub fn read_keyboard(keyboard: &KeyboardState) -> u16 {
 
     if keyboard.is_scancode_pressed(Scancode::Z) { keys |= KEY_A; }
     if keyboard.is_scancode_pressed(Scancode::X) { keys |= KEY_B; }
-    if keyboard.is_scancode_pressed(Scancode::Return) { keys |= KEY_START; }
-    if keyboard.is_scancode_pressed(Scancode::Backspace) { keys |= KEY_SELECT; }
+    // Start: Return or Space (either works — some macOS keyboards make Enter flaky)
+    if keyboard.is_scancode_pressed(Scancode::Return)
+        || keyboard.is_scancode_pressed(Scancode::KpEnter)
+        || keyboard.is_scancode_pressed(Scancode::Space)
+    { keys |= KEY_START; }
+    // Select: Backspace or Tab
+    if keyboard.is_scancode_pressed(Scancode::Backspace)
+        || keyboard.is_scancode_pressed(Scancode::Tab)
+    { keys |= KEY_SELECT; }
     if keyboard.is_scancode_pressed(Scancode::Right) { keys |= KEY_RIGHT; }
     if keyboard.is_scancode_pressed(Scancode::Left) { keys |= KEY_LEFT; }
     if keyboard.is_scancode_pressed(Scancode::Up) { keys |= KEY_UP; }

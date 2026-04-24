@@ -139,6 +139,12 @@ impl Channel1 {
             self.timer = (2048 - self.frequency as u32) * 4;
             self.duty_pos = (self.duty_pos + 1) % 8;
         }
+        self.output()
+    }
+
+    /// Read the current sample without advancing state.
+    pub fn output(&self) -> i16 {
+        if !self.enabled { return 0; }
         let wave = DUTY_TABLE[self.duty as usize & 3][self.duty_pos as usize];
         if wave != 0 { self.envelope_volume as i16 } else { -(self.envelope_volume as i16) }
     }
@@ -209,6 +215,11 @@ impl Channel2 {
             self.timer = (2048 - self.frequency as u32) * 4;
             self.duty_pos = (self.duty_pos + 1) % 8;
         }
+        self.output()
+    }
+
+    pub fn output(&self) -> i16 {
+        if !self.enabled { return 0; }
         let wave = DUTY_TABLE[self.duty as usize & 3][self.duty_pos as usize];
         if wave != 0 { self.envelope_volume as i16 } else { -(self.envelope_volume as i16) }
     }
@@ -266,10 +277,12 @@ impl Channel3 {
             let total_samples = if self.dimension { 64 } else { 32 };
             self.sample_pos = (self.sample_pos + 1) % total_samples;
         }
+        self.output()
+    }
 
-        // Read 4-bit sample from wave RAM
+    pub fn output(&self) -> i16 {
+        if !self.enabled || !self.dac_enabled { return 0; }
         let pos = if !self.dimension {
-            // Single bank: play bank opposite to selected
             let bank_offset = if self.bank_select == 0 { 16 } else { 0 };
             bank_offset + self.sample_pos as usize
         } else {
@@ -291,10 +304,9 @@ impl Channel3 {
             _ => sample,
         };
 
-        // If force 75%, apply additional shift
         let shifted = if self.force_75 { (sample * 3) / 4 } else { shifted };
 
-        shifted as i16 - 8 // Center around 0
+        shifted as i16 - 8
     }
 }
 
@@ -371,7 +383,6 @@ impl Channel4 {
         if self.timer > 0 { self.timer -= 1; }
         if self.timer == 0 {
             self.timer = self.divisor() << self.clock_shift;
-            // Clock the LFSR
             let xor_bit = (self.lfsr & 1) ^ ((self.lfsr >> 1) & 1);
             self.lfsr >>= 1;
             self.lfsr |= xor_bit << 14;
@@ -379,8 +390,12 @@ impl Channel4 {
                 self.lfsr = (self.lfsr & !(1 << 6)) | (xor_bit << 6);
             }
         }
-        let output = if self.lfsr & 1 == 0 { self.envelope_volume as i16 } else { -(self.envelope_volume as i16) };
-        output
+        self.output()
+    }
+
+    pub fn output(&self) -> i16 {
+        if !self.enabled { return 0; }
+        if self.lfsr & 1 == 0 { self.envelope_volume as i16 } else { -(self.envelope_volume as i16) }
     }
 }
 

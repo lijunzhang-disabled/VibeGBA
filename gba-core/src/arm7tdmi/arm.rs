@@ -10,10 +10,6 @@ use crate::bus::Bus;
 impl Cpu {
     /// Execute a single ARM instruction. Returns cycles consumed.
     pub fn execute_arm(&mut self, bus: &mut Bus, opcode: u32) -> u32 {
-        // Dispatch based on instruction format.
-        // We use the bit-pattern approach rather than a full LUT for clarity.
-        // This can be converted to a LUT later for performance.
-
         let bits_27_20 = (opcode >> 20) & 0xFF;
         let bits_7_4 = (opcode >> 4) & 0xF;
 
@@ -116,7 +112,16 @@ impl Cpu {
         let rn = ((opcode >> 16) & 0xF) as u8;
         let rd = ((opcode >> 12) & 0xF) as u8;
 
-        let op1 = self.reg(rn);
+        // Shift-by-register (bit 4 = 1 in register operand form) spends an
+        // extra internal cycle that advances the prefetch: any PC read (Rn,
+        // Rm, or Rs) returns PC+12 instead of PC+8.
+        let shift_by_reg = !i && opcode & (1 << 4) != 0;
+
+        let op1 = if rn == 15 && shift_by_reg {
+            self.reg(15).wrapping_add(4)
+        } else {
+            self.reg(rn)
+        };
 
         // Compute operand 2 and shifter carry out
         let (op2, shifter_carry) = if i {
@@ -134,23 +139,24 @@ impl Cpu {
             let rm = (opcode & 0xF) as u8;
             let shift_type = ShiftType::from_u8(((opcode >> 5) & 3) as u8);
 
-            let (shift_amount, extra_cycle) = if opcode & (1 << 4) != 0 {
+            let (shift_amount, extra_cycle) = if shift_by_reg {
                 // Shift by register
                 let rs = ((opcode >> 8) & 0xF) as u8;
-                (self.reg(rs) as u8, true)
+                let rs_val = if rs == 15 { self.reg(15).wrapping_add(4) } else { self.reg(rs) };
+                (rs_val as u8, true)
             } else {
                 // Shift by immediate
                 let amount = ((opcode >> 7) & 0x1F) as u8;
                 (amount, false)
             };
 
-            let rm_val = if rm == 15 && opcode & (1 << 4) != 0 {
+            let rm_val = if rm == 15 && shift_by_reg {
                 self.reg(15).wrapping_add(4) // Extra +4 when shift by register and Rm=PC
             } else {
                 self.reg(rm)
             };
 
-            let immediate_shift = opcode & (1 << 4) == 0;
+            let immediate_shift = !shift_by_reg;
             let _ = extra_cycle; // TODO: add extra cycle for register shift
             barrel_shift(rm_val, shift_type, shift_amount, self.cpsr.c(), immediate_shift)
         };
@@ -173,8 +179,19 @@ impl Cpu {
 
         if s {
             if rd == 15 {
-                // Rd=R15 with S: restore CPSR from SPSR
-                self.set_reg_with_flags(rd, result, true);
+                if op.is_test() {
+                    // TSTP/TEQP/CMPP/CMNP (ARMv2 P-variants, kept for
+                    // compatibility): restore CPSR from SPSR but do NOT
+                    // write the ALU result to PC.
+                    let spsr = self.spsr();
+                    let new_mode = spsr.mode();
+                    self.switch_mode(new_mode);
+                    self.cpsr = spsr;
+                } else {
+                    // Other data-proc with Rd=R15 and S: write result to PC
+                    // and restore CPSR from SPSR.
+                    self.set_reg_with_flags(rd, result, true);
+                }
             } else {
                 self.cpsr.set_nz(result);
                 self.cpsr.set_c(carry);
@@ -324,8 +341,10 @@ impl Cpu {
             }
         }
 
-        // Write-back: update Rn with offset address
-        if !p || w {
+        // Write-back: update Rn with offset address.
+        // For LDR with Rn==Rd, the load wins over the writeback (ARM7TDMI
+        // behavior), so skip writeback in that case.
+        if (!p || w) && !(l && rn == rd) {
             if rn != 15 {
                 self.regs[rn as usize] = offset_addr;
             }
@@ -368,8 +387,10 @@ impl Cpu {
         if l {
             let val = match sh {
                 0x1 => {
-                    // LDRH: unsigned halfword
-                    bus.read16(addr & !1) as u32
+                    // LDRH: unsigned halfword. ARM7TDMI quirk: misaligned addr
+                    // reads aligned halfword, rotates result right by 8.
+                    let val = bus.read16(addr & !1) as u32;
+                    if addr & 1 != 0 { val.rotate_right(8) } else { val }
                 }
                 0x2 => {
                     // LDRSB: signed byte
@@ -597,12 +618,16 @@ impl Cpu {
             psr.bits = (psr.bits & !mask) | (val & mask);
             self.set_spsr(psr);
         } else {
+            // Compute new CPSR bits first; if the mode bits change, call
+            // switch_mode BEFORE mutating self.cpsr so it can read the true
+            // current (old) mode and bank the right registers.
             let old_mode = self.cpsr.mode();
-            self.cpsr.bits = (self.cpsr.bits & !mask) | (val & mask);
-            let new_mode = self.cpsr.mode();
+            let new_bits = (self.cpsr.bits & !mask) | (val & mask);
+            let new_mode = super::Psr { bits: new_bits }.mode();
             if old_mode != new_mode {
                 self.switch_mode(new_mode);
             }
+            self.cpsr.bits = new_bits;
         }
 
         1

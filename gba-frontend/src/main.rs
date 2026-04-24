@@ -197,40 +197,52 @@ fn main() {
             continue;
         }
 
-        // Run one frame (or build a test pattern if --test-pattern)
-        let framebuffer: &[u16] = if args.test_pattern {
+        // Run one frame split into chunks so we can pump audio more often
+        // (every ~4 ms of emulated time instead of every ~16 ms). This makes
+        // buffer-level fluctuations much smaller and eliminates periodic gaps.
+        const CHUNKS_PER_FRAME: u64 = 4;
+        const CHUNK_CYCLES: u64 = gba_core::CYCLES_PER_FRAME / CHUNKS_PER_FRAME;
+
+        if args.test_pattern {
             // 4 vertical stripes: red | green | blue | white
             for y in 0..160 {
                 for x in 0..240 {
                     let color = match x / 60 {
-                        0 => 0x001F, // red
-                        1 => 0x03E0, // green
-                        2 => 0x7C00, // blue
-                        _ => 0x7FFF, // white
+                        0 => 0x001F, 1 => 0x03E0, 2 => 0x7C00, _ => 0x7FFF,
                     };
                     test_buf[y * 240 + x] = color;
                 }
             }
-            &test_buf
+            display.render(&test_buf);
         } else {
-            gba.run_frame()
-        };
-
-        // Display
-        display.render(framebuffer);
-
-        // Pump audio samples to SDL2
-        if let Some((ref audio_buf, ref _device)) = audio_state {
-            let n = gba.drain_audio(&mut audio_tmp);
-            if n > 0 {
-                audio_buf.push_samples(&audio_tmp[..n]);
+            for _ in 0..CHUNKS_PER_FRAME {
+                gba.run_cycles(CHUNK_CYCLES);
+                // Pump audio after each chunk
+                if let Some((ref audio_buf, ref _device)) = audio_state {
+                    let n = gba.drain_audio(&mut audio_tmp);
+                    if n > 0 {
+                        audio_buf.push_samples(&audio_tmp[..n]);
+                    }
+                }
             }
+            display.render(gba.framebuffer());
         }
 
-        // Frame timing
-        let elapsed = frame_start.elapsed();
-        if elapsed < frame_duration {
-            std::thread::sleep(frame_duration - elapsed);
+        // Pacing: audio-synced if audio enabled, else wall-clock 60 Hz.
+        if let Some((ref audio_buf, ref _device)) = audio_state {
+            // Wait until the buffer drains to target level. SDL2 is the master
+            // clock — we only run the emulator as fast as the audio callback
+            // consumes samples. This keeps latency bounded and prevents the
+            // burst-production artifacts that cause "up and down" noise.
+            while audio_buf.level() > audio::BUFFER_HIGH {
+                std::thread::sleep(Duration::from_millis(1));
+                if audio_buf.level() <= audio::BUFFER_TARGET { break; }
+            }
+        } else {
+            let elapsed = frame_start.elapsed();
+            if elapsed < frame_duration {
+                std::thread::sleep(frame_duration - elapsed);
+            }
         }
     }
 

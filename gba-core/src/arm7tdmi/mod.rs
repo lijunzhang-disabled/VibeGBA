@@ -130,7 +130,7 @@ pub struct Cpu {
     /// Pipeline: two prefetched opcodes.
     pipeline: [u32; 2],
     /// Whether the pipeline needs to be refilled (after branch).
-    pub(crate) pipeline_flushed: bool,
+    pub pipeline_flushed: bool,
     /// CPU is halted (waiting for interrupt).
     pub halted: bool,
     /// Pending SWI comment (set by SWI instruction, consumed by Gba::step).

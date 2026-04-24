@@ -5,12 +5,17 @@ use psg::{Channel1, Channel2, Channel3, Channel4};
 use fifo::FifoChannel;
 use serde::{Deserialize, Serialize};
 
-/// GBA sample rate determined by SOUNDBIAS (default: 32768 Hz).
-pub const SAMPLE_RATE: u32 = 32768;
-/// CPU cycles per audio sample: 16777216 / 32768 = 512.
-pub const CYCLES_PER_SAMPLE: u32 = 512;
-/// Frame sequencer rate: 512 Hz → 32768 cycles between steps.
-pub const CYCLES_PER_FRAME_SEQ: u32 = 32768;
+/// Output sample rate delivered to the frontend.
+/// Chosen to match the macOS Core Audio native rate (48 kHz) so SDL2 does
+/// not need to resample internally — that resampling is a major source of
+/// aliasing artifacts.
+pub const OUTPUT_SAMPLE_RATE: u32 = 48_000;
+
+/// GBA CPU clock. Each tick of the APU corresponds to one CPU cycle.
+pub const CPU_CLOCK_HZ: u32 = 16_777_216;
+
+/// Frame sequencer runs at 512 Hz → one step every CPU_CLOCK_HZ / 512 cycles.
+pub const CYCLES_PER_FRAME_SEQ: u32 = 32_768;
 
 #[derive(Serialize, Deserialize)]
 pub struct Apu {
@@ -22,26 +27,42 @@ pub struct Apu {
     // FIFO channels
     pub fifo_a: FifoChannel,
     pub fifo_b: FifoChannel,
+
     // Master enable (SOUNDCNT_X bit 7)
     pub master_enable: bool,
     // SOUNDCNT_L: PSG volume and panning
     pub psg_volume_right: u8, // 0-7
     pub psg_volume_left: u8,  // 0-7
-    pub psg_enable_right: [bool; 4], // Ch1-4 right enable
-    pub psg_enable_left: [bool; 4],  // Ch1-4 left enable
+    pub psg_enable_right: [bool; 4],
+    pub psg_enable_left: [bool; 4],
     // SOUNDCNT_H: DMA sound control
     pub psg_master_volume: u8, // 0=25%, 1=50%, 2=100%
     // SOUNDBIAS
-    pub bias_level: u16, // Default 0x200
+    pub bias_level: u16,
+
     // Frame sequencer
     frame_seq_step: u8,
     frame_seq_counter: u32,
-    // Sample accumulator
-    sample_counter: u32,
-    /// Output sample buffer — emulation thread writes, audio thread reads.
-    /// Stores interleaved (left, right) i16 samples.
+
+    // Oversampling decimation state.
+    // Every CPU cycle we compute the current mixed sample and add it to the
+    // accumulator. When the fractional counter crosses an output-sample
+    // boundary, we emit the average. The averaging acts as a boxcar
+    // anti-aliasing filter (decimation factor ≈ 349), which naturally
+    // suppresses the harsh high-frequency content that plagues the naive
+    // "emit raw current sample" approach.
+    sample_frac: u64,  // accumulates OUTPUT_SAMPLE_RATE per cycle; wraps at CPU_CLOCK_HZ
+    accum_left: i64,
+    accum_right: i64,
+    accum_count: u32,
+
+    // 1-stage post-IIR LPF — gentle smoothing only; the boxcar averaging
+    // does the heavy anti-aliasing.
+    lpf_left: [i32; 1],
+    lpf_right: [i32; 1],
+
+    /// Output sample buffer — interleaved stereo i16 at OUTPUT_SAMPLE_RATE.
     pub sample_buffer: Vec<i16>,
-    /// Maximum samples to buffer before dropping (prevents unbounded growth).
     pub sample_buffer_max: usize,
 }
 
@@ -63,48 +84,133 @@ impl Apu {
             bias_level: 0x200,
             frame_seq_step: 0,
             frame_seq_counter: 0,
-            sample_counter: 0,
-            sample_buffer: Vec::with_capacity(4096),
-            sample_buffer_max: 8192,
+            sample_frac: 0,
+            accum_left: 0,
+            accum_right: 0,
+            accum_count: 0,
+            lpf_left: [0; 1],
+            lpf_right: [0; 1],
+            sample_buffer: Vec::with_capacity(8192),
+            sample_buffer_max: 16384,
         }
     }
 
     /// Tick the APU by N CPU cycles. Called after each CPU step.
-    /// Returns true if FIFO A or B needs a DMA refill.
     pub fn tick(&mut self, cycles: u32) -> (bool, bool) {
-        if !self.master_enable {
-            self.sample_counter += cycles;
-            while self.sample_counter >= CYCLES_PER_SAMPLE {
-                self.sample_counter -= CYCLES_PER_SAMPLE;
-                self.push_silence();
-            }
-            return (false, false);
-        }
-
-        // Tick PSG channels
         for _ in 0..cycles {
+            // Advance each channel by one CPU cycle so their internal timers
+            // and waveform state step at the correct emulated rate.
             self.ch1.tick();
             self.ch2.tick();
             self.ch3.tick();
             self.ch4.tick();
 
-            // Frame sequencer
+            // Frame sequencer (512 Hz)
             self.frame_seq_counter += 1;
             if self.frame_seq_counter >= CYCLES_PER_FRAME_SEQ {
                 self.frame_seq_counter -= CYCLES_PER_FRAME_SEQ;
                 self.clock_frame_sequencer();
             }
 
-            // Sample output
-            self.sample_counter += 1;
-            if self.sample_counter >= CYCLES_PER_SAMPLE {
-                self.sample_counter -= CYCLES_PER_SAMPLE;
-                self.generate_sample();
+            // Accumulate the current mixed sample for oversampling
+            if self.master_enable {
+                let (l, r) = self.current_mix();
+                self.accum_left += l as i64;
+                self.accum_right += r as i64;
+            }
+            self.accum_count += 1;
+
+            // Fractional counter: emit an output sample when we cross a
+            // sample boundary at OUTPUT_SAMPLE_RATE relative to CPU_CLOCK_HZ.
+            self.sample_frac += OUTPUT_SAMPLE_RATE as u64;
+            if self.sample_frac >= CPU_CLOCK_HZ as u64 {
+                self.sample_frac -= CPU_CLOCK_HZ as u64;
+                self.emit_sample();
             }
         }
-
-        // FIFO refill is handled separately via on_timer_overflow()
+        // FIFO refill is handled in on_timer_overflow()
         (false, false)
+    }
+
+    /// Compute the current mixed sample (pre-scaling). Each PSG channel is
+    /// in -15..15 and each FIFO channel is in -128..127, so `left` and
+    /// `right` span roughly -300..300.
+    fn current_mix(&self) -> (i32, i32) {
+        // PSG channel outputs (do NOT advance state — tick() already did)
+        let ch1 = self.ch1.output() as i32;
+        let ch2 = self.ch2.output() as i32;
+        let ch3 = self.ch3.output() as i32;
+        let ch4 = self.ch4.output() as i32;
+
+        let mut psg_left = 0i32;
+        let mut psg_right = 0i32;
+        if self.psg_enable_left[0] { psg_left += ch1; }
+        if self.psg_enable_left[1] { psg_left += ch2; }
+        if self.psg_enable_left[2] { psg_left += ch3; }
+        if self.psg_enable_left[3] { psg_left += ch4; }
+        if self.psg_enable_right[0] { psg_right += ch1; }
+        if self.psg_enable_right[1] { psg_right += ch2; }
+        if self.psg_enable_right[2] { psg_right += ch3; }
+        if self.psg_enable_right[3] { psg_right += ch4; }
+
+        // SOUNDCNT_L per-side volume (0-7)
+        psg_left = psg_left * (self.psg_volume_left as i32 + 1) / 8;
+        psg_right = psg_right * (self.psg_volume_right as i32 + 1) / 8;
+
+        // SOUNDCNT_H PSG master ratio: 0=25%, 1=50%, 2/3=100%
+        let psg_ratio = match self.psg_master_volume { 0 => 1, 1 => 2, _ => 4 };
+        psg_left = psg_left * psg_ratio / 4;
+        psg_right = psg_right * psg_ratio / 4;
+
+        // FIFO channels (held values)
+        let fifo_a = self.fifo_a.output() as i32;
+        let fifo_b = self.fifo_b.output() as i32;
+        let mut left = psg_left;
+        let mut right = psg_right;
+        if self.fifo_a.enable_left { left += fifo_a; }
+        if self.fifo_a.enable_right { right += fifo_a; }
+        if self.fifo_b.enable_left { left += fifo_b; }
+        if self.fifo_b.enable_right { right += fifo_b; }
+
+        (left, right)
+    }
+
+    /// Decimate accumulated samples and emit one output sample.
+    fn emit_sample(&mut self) {
+        if self.accum_count == 0 {
+            // No samples accumulated — push silence (shouldn't happen normally)
+            self.push_pair(0, 0);
+            return;
+        }
+
+        // Average: boxcar filter with decimation factor ≈ 349.
+        // Strong anti-alias property due to the large filter length.
+        let n = self.accum_count as i64;
+        let avg_left = (self.accum_left / n) as i32;
+        let avg_right = (self.accum_right / n) as i32;
+        self.accum_left = 0;
+        self.accum_right = 0;
+        self.accum_count = 0;
+
+        // Scale: averaging over ~349 cycles suppresses peaks, so we compensate.
+        // 120× balances loudness (peaks ~15k) against transient noise.
+        let scaled_left = (avg_left * 120).clamp(-32768, 32767);
+        let scaled_right = (avg_right * 120).clamp(-32768, 32767);
+
+        // 1-stage gentle IIR post-filter (α=0.5) — just smooth step edges.
+        self.lpf_left[0] = (self.lpf_left[0] + scaled_left) / 2;
+        self.lpf_right[0] = (self.lpf_right[0] + scaled_right) / 2;
+
+        let left_out = self.lpf_left[0].clamp(-32768, 32767) as i16;
+        let right_out = self.lpf_right[0].clamp(-32768, 32767) as i16;
+        self.push_pair(left_out, right_out);
+    }
+
+    fn push_pair(&mut self, left: i16, right: i16) {
+        if self.sample_buffer.len() < self.sample_buffer_max {
+            self.sample_buffer.push(left);
+            self.sample_buffer.push(right);
+        }
     }
 
     /// Called when Timer 0 or Timer 1 overflows — advance FIFO sample.
@@ -161,73 +267,6 @@ impl Apu {
         self.frame_seq_step = (self.frame_seq_step + 1) % 8;
     }
 
-    /// Generate one output sample (left + right) and push to the buffer.
-    fn generate_sample(&mut self) {
-        let ch1 = self.ch1.tick();
-        let ch2 = self.ch2.tick();
-        let ch3 = self.ch3.tick();
-        let ch4 = self.ch4.tick();
-
-        // PSG mixing: each channel output is -15..15
-        let mut psg_left: i32 = 0;
-        let mut psg_right: i32 = 0;
-
-        if self.psg_enable_left[0] { psg_left += ch1 as i32; }
-        if self.psg_enable_left[1] { psg_left += ch2 as i32; }
-        if self.psg_enable_left[2] { psg_left += ch3 as i32; }
-        if self.psg_enable_left[3] { psg_left += ch4 as i32; }
-        if self.psg_enable_right[0] { psg_right += ch1 as i32; }
-        if self.psg_enable_right[1] { psg_right += ch2 as i32; }
-        if self.psg_enable_right[2] { psg_right += ch3 as i32; }
-        if self.psg_enable_right[3] { psg_right += ch4 as i32; }
-
-        // Apply PSG master volume (0-7, effectively multiply by (vol+1)/8)
-        psg_left = psg_left * (self.psg_volume_left as i32 + 1) / 8;
-        psg_right = psg_right * (self.psg_volume_right as i32 + 1) / 8;
-
-        // Apply PSG ratio from SOUNDCNT_H
-        let psg_ratio = match self.psg_master_volume {
-            0 => 1, // 25%
-            1 => 2, // 50%
-            _ => 4, // 100%
-        };
-        psg_left = psg_left * psg_ratio / 4;
-        psg_right = psg_right * psg_ratio / 4;
-
-        // FIFO mixing: output is -128..127
-        let fifo_a = self.fifo_a.output() as i32;
-        let fifo_b = self.fifo_b.output() as i32;
-
-        let mut left: i32 = psg_left;
-        let mut right: i32 = psg_right;
-
-        if self.fifo_a.enable_left { left += fifo_a; }
-        if self.fifo_a.enable_right { right += fifo_a; }
-        if self.fifo_b.enable_left { left += fifo_b; }
-        if self.fifo_b.enable_right { right += fifo_b; }
-
-        // Apply SOUNDBIAS and clamp to 10-bit (0..0x3FF)
-        let bias = self.bias_level as i32;
-        left = (left + bias).clamp(0, 0x3FF);
-        right = (right + bias).clamp(0, 0x3FF);
-
-        // Convert to signed 16-bit for output (-32768..32767)
-        let left_out = ((left - bias) * 64).clamp(-32768, 32767) as i16;
-        let right_out = ((right - bias) * 64).clamp(-32768, 32767) as i16;
-
-        if self.sample_buffer.len() < self.sample_buffer_max {
-            self.sample_buffer.push(left_out);
-            self.sample_buffer.push(right_out);
-        }
-    }
-
-    fn push_silence(&mut self) {
-        if self.sample_buffer.len() < self.sample_buffer_max {
-            self.sample_buffer.push(0);
-            self.sample_buffer.push(0);
-        }
-    }
-
     /// Drain samples from the buffer (called by the audio thread).
     pub fn drain_samples(&mut self, out: &mut [i16]) -> usize {
         let available = self.sample_buffer.len().min(out.len());
@@ -238,16 +277,15 @@ impl Apu {
 
     // ─── Register read/write ──────────────────────────────────────
 
-    /// Write to a sound register (address relative to 0x04000060).
     pub fn write_reg(&mut self, offset: u16, value: u16) {
         match offset {
-            // SOUND1CNT_L (NR10) — Sweep
+            // SOUND1CNT_L — Sweep
             0x00 => {
                 self.ch1.sweep_shift = (value & 7) as u8;
                 self.ch1.sweep_negate = value & (1 << 3) != 0;
                 self.ch1.sweep_period = ((value >> 4) & 7) as u8;
             }
-            // SOUND1CNT_H (NR11/NR12) — Duty/Length/Envelope
+            // SOUND1CNT_H — Duty/Length/Envelope
             0x02 => {
                 self.ch1.length_load = (value & 0x3F) as u8;
                 self.ch1.duty = ((value >> 6) & 3) as u8;
@@ -255,13 +293,13 @@ impl Apu {
                 self.ch1.envelope_dir = value & (1 << 11) != 0;
                 self.ch1.envelope_init = ((value >> 12) & 0xF) as u8;
             }
-            // SOUND1CNT_X (NR13/NR14) — Frequency/Control
+            // SOUND1CNT_X — Frequency/Control
             0x04 => {
                 self.ch1.frequency = value & 0x7FF;
                 self.ch1.length_enabled = value & (1 << 14) != 0;
                 if value & (1 << 15) != 0 { self.ch1.trigger(); }
             }
-            // SOUND2CNT_L (NR21/NR22)
+            // SOUND2CNT_L
             0x08 => {
                 self.ch2.length_load = (value & 0x3F) as u8;
                 self.ch2.duty = ((value >> 6) & 3) as u8;
@@ -269,38 +307,38 @@ impl Apu {
                 self.ch2.envelope_dir = value & (1 << 11) != 0;
                 self.ch2.envelope_init = ((value >> 12) & 0xF) as u8;
             }
-            // SOUND2CNT_H (NR23/NR24)
+            // SOUND2CNT_H
             0x0C => {
                 self.ch2.frequency = value & 0x7FF;
                 self.ch2.length_enabled = value & (1 << 14) != 0;
                 if value & (1 << 15) != 0 { self.ch2.trigger(); }
             }
-            // SOUND3CNT_L (NR30)
+            // SOUND3CNT_L
             0x10 => {
                 self.ch3.dimension = value & (1 << 5) != 0;
                 self.ch3.bank_select = ((value >> 6) & 1) as u8;
                 self.ch3.dac_enabled = value & (1 << 7) != 0;
             }
-            // SOUND3CNT_H (NR31/NR32)
+            // SOUND3CNT_H
             0x12 => {
                 self.ch3.length_load = (value & 0xFF) as u16;
                 self.ch3.volume_code = ((value >> 13) & 3) as u8;
                 self.ch3.force_75 = value & (1 << 15) != 0;
             }
-            // SOUND3CNT_X (NR33/NR34)
+            // SOUND3CNT_X
             0x14 => {
                 self.ch3.frequency = value & 0x7FF;
                 self.ch3.length_enabled = value & (1 << 14) != 0;
                 if value & (1 << 15) != 0 { self.ch3.trigger(); }
             }
-            // SOUND4CNT_L (NR41/NR42)
+            // SOUND4CNT_L
             0x18 => {
                 self.ch4.length_load = (value & 0x3F) as u8;
                 self.ch4.envelope_period = (value >> 8 & 7) as u8;
                 self.ch4.envelope_dir = value & (1 << 11) != 0;
                 self.ch4.envelope_init = ((value >> 12) & 0xF) as u8;
             }
-            // SOUND4CNT_H (NR43/NR44)
+            // SOUND4CNT_H
             0x1C => {
                 self.ch4.divisor_code = (value & 7) as u8;
                 self.ch4.width_mode = value & (1 << 3) != 0;
@@ -352,19 +390,16 @@ impl Apu {
                 if idx < 32 { self.ch3.wave_ram[idx] = bytes[0]; }
                 if idx + 1 < 32 { self.ch3.wave_ram[idx + 1] = bytes[1]; }
             }
-            // FIFO_A (0xA0)
-            0x40 => {
-                self.fifo_a.write32(value as u32);
-            }
-            // FIFO_B (0xA4)
-            0x44 => {
-                self.fifo_b.write32(value as u32);
-            }
+            // FIFO_A low (0xA0) and high (0xA2) halves — each writes 2 samples
+            0x40 => self.fifo_a.write16(value),
+            0x42 => self.fifo_a.write16(value),
+            // FIFO_B low (0xA4) and high (0xA6)
+            0x44 => self.fifo_b.write16(value),
+            0x46 => self.fifo_b.write16(value),
             _ => {}
         }
     }
 
-    /// Read a sound register (address relative to 0x04000060).
     pub fn read_reg(&self, offset: u16) -> u16 {
         match offset {
             0x00 => {
@@ -406,20 +441,27 @@ mod tests {
     #[test]
     fn test_apu_master_enable() {
         let mut apu = Apu::new();
-        apu.write_reg(0x24, 1 << 7); // Master enable
+        apu.write_reg(0x24, 1 << 7);
         assert!(apu.master_enable);
-        apu.write_reg(0x24, 0); // Disable
+        apu.write_reg(0x24, 0);
         assert!(!apu.master_enable);
     }
 
     #[test]
-    fn test_apu_generates_samples() {
+    fn test_apu_generates_samples_at_48khz() {
         let mut apu = Apu::new();
         apu.master_enable = true;
+        apu.sample_buffer_max = 200_000; // lift cap for the test
 
-        // Tick for enough cycles to generate at least one sample (512 cycles)
-        apu.tick(1024);
-        assert!(apu.sample_buffer.len() >= 4); // At least 2 stereo samples
+        // 16777216 CPU cycles = 1 emulated second = 48000 samples = 96000 i16 values.
+        apu.tick(CPU_CLOCK_HZ);
+        let n_samples = apu.sample_buffer.len() / 2;
+        // Allow ±1 due to fractional rounding
+        assert!(
+            (n_samples as i64 - 48000).abs() <= 1,
+            "expected ~48000 samples, got {}",
+            n_samples
+        );
     }
 
     #[test]
@@ -429,30 +471,18 @@ mod tests {
         apu.fifo_a.volume_full = true;
         apu.fifo_a.enable_left = true;
         apu.fifo_a.enable_right = true;
-
-        // Fill FIFO with test data
         apu.fifo_a.write32(0x10203040);
 
-        // Timer 0 overflow should pop a sample
         let (needs_a, _) = apu.on_timer_overflow(0);
         assert_eq!(apu.fifo_a.current_sample, 0x40);
-        assert!(needs_a); // Only 3 samples left → needs refill
+        assert!(needs_a);
     }
 
     #[test]
     fn test_soundcnt_h_parse() {
         let mut apu = Apu::new();
-        // FIFO A: 100% vol, right+left, timer 0
-        // FIFO B: 50% vol, right only, timer 1
-        let val: u16 = (1 << 2)  // FIFO A volume full
-            | (1 << 8)           // FIFO A right
-            | (1 << 9)           // FIFO A left
-            | (0 << 10)          // FIFO A timer 0
-            | (1 << 12)          // FIFO B right
-            | (0 << 13)          // FIFO B left off
-            | (1 << 14);         // FIFO B timer 1
+        let val: u16 = (1 << 2) | (1 << 8) | (1 << 9) | (1 << 12) | (1 << 14);
         apu.write_reg(0x22, val);
-
         assert!(apu.fifo_a.volume_full);
         assert!(apu.fifo_a.enable_right);
         assert!(apu.fifo_a.enable_left);
