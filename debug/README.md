@@ -2,8 +2,8 @@
 
 This folder stores two kinds of documents:
 
-1. **Bug investigations** — one markdown per bug, recording symptom → root cause → fix → verification. Named `YYYY-MM-DD_<short-slug>.md`.
-2. **Concept notes** — explanations of how parts of the emulator work, for self-reference. Named by topic (e.g., `concepts.md`).
+1. **Bug investigations** — one markdown per bug, recording symptom → root cause → fix → verification. Named `YYYY-MM-DD_<short-slug>.md` and lives at the top of `debug/`.
+2. **Concept notes** — explanations of how parts of the emulator work, for self-reference. Lives in `debug/concepts/`, one file per topic. See [concepts/README.md](concepts/README.md) for the index.
 
 ## Bug index
 
@@ -17,9 +17,12 @@ This folder stores two kinds of documents:
 
 ## Concept notes
 
-| Topic | Doc |
-|---|---|
-| Emulator basics + event scheduler deep-dive | [concepts.md](concepts.md) |
+See [concepts/README.md](concepts/README.md) for the full index. Current topics:
+
+- [emulator-basics](concepts/emulator-basics.md) — what the emulator does at a high level, frame loop, components.
+- [scheduler](concepts/scheduler.md) — the priority-queue event dispatcher.
+- [blanking-periods](concepts/blanking-periods.md) — HBlank, VBlank, and why they matter.
+- [fifo-dma-vblank](concepts/fifo-dma-vblank.md) — DirectSound FIFO DMA and the VBlank reset hook.
 
 ## Template
 
