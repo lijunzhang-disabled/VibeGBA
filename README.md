@@ -1,4 +1,4 @@
-# VibeGameBoy — GBA Emulator in Rust
+# VibeGBA — GBA Emulator in Rust
 
 A Game Boy Advance emulator written from scratch in Rust, with an SDL2 frontend. Built for learning — every hardware component is implemented as a Rust data structure that ticks forward in lockstep with the CPU.
 
