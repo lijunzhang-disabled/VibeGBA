@@ -16,7 +16,9 @@ Each Timer 0 overflow, the DMA controller transfers exactly **4 words (16 bytes 
 
 ## The problem this creates
 
-If you set `SAD = buffer_start` and let DMA run, the internal source advances 224 bytes per frame (13379 × 1/60). After a few frames it has walked past the end of the buffer and starts reading whatever is in the next region of memory — typically uninitialised IWRAM, game state, or VRAM. The FIFO then plays that as "audio", which sounds like noise.
+If you set `SAD = buffer_start` and let DMA run, the internal source advances 224 bytes per frame (13379 × 1/60). After **one** frame it has already walked past the end of a typical M4A buffer and starts reading whatever is in the next region of memory — typically uninitialised IWRAM, game state, or VRAM. The FIFO then plays that as "audio", which sounds like noise.
+
+Concretely for Pokémon Emerald, the FIFO A buffer at `0x030066D0` is exactly **224 bytes** (one frame's worth). M4A overwrites those 224 bytes with the next frame's samples every VBlank. DMA reads 224 bytes per frame too — so if `internal_sad` doesn't reset back to `0x030066D0` each VBlank, by the next frame DMA is reading from `0x030067B0` onwards, where M4A has never written anything.
 
 ## How the hardware expects games to fix this
 
@@ -46,6 +48,48 @@ Rather than guess at the missing path, we do the safe thing: at every VBlank, in
 The behavioural cost: for games that *do* call SWI 0x1D themselves, our reset is redundant (idempotent — re-latching to the same value is a no-op). We never worsen behaviour; we only rescue games like Pokémon that depend on the reset happening but don't drive it through a path our emulator handles.
 
 If you ever find a game whose audio breaks because of this auto-reset (e.g. a game intentionally lets DMA stream through a long contiguous buffer without resetting), the right fix is to remove the auto-reset and trace down why the game's SWI 0x1D / inlined equivalent isn't running.
+
+## Why only Special-timed DMA needs this
+
+A natural follow-up: if `internal_sad` walks forever, doesn't *every* DMA channel have this problem — including the VBlank/HBlank ones used for graphics? Why is our reset specifically targeting `Special`-timed DMA1/DMA2?
+
+The answer is a combination of **firing rate** and **whether the walk is wanted**.
+
+| Timing | Fires when… | Rate | Walk per frame | Game's intent |
+|---|---|---|---|---|
+| `Immediate` | enable bit goes 0→1 | once per "submit" | n/a (one-shot) | Channel disables itself when count hits 0. No repetition. |
+| `VBlank` | scanline → 160 | 60 Hz | small (`count × 4` bytes per frame) | Usually a fresh setup each frame anyway. |
+| `HBlank` | every scanline | ~14,400 Hz | tracks scanline count | **Wants** the walk — one entry per scanline (HDMA effects). |
+| `Special` (FIFO) | every Timer 0 overflow | ~13,379 Hz | 224 bytes per frame | **Doesn't** want the walk — replay one buffer on a loop. |
+
+**Immediate.** One-shot. Hardware clears the enable bit after the transfer completes. Nothing to walk.
+
+**VBlank.** Fires once per frame. A typical use is "copy 1 KB from a sprite-table buffer in EWRAM into OAM at VBlank." If the game uses `Repeat` mode, `internal_sad` does walk forward — but most games disable+re-enable each frame anyway (because the source changes per-frame, e.g. different sprite list), which re-latches everything. When games *do* leave it running with `Repeat` and a small `count`, the walk is slow enough that it usually points at fresh CPU-rendered data.
+
+**HBlank.** The classic HDMA trick: each scanline, copy *one* entry from a 160-entry table into a register. E.g. update `BG2X` per line for a wavy water effect, or per-line palette swaps for split-screen, or Mode 7-style affine transforms.
+
+```
+ source: [scroll[0], scroll[1], scroll[2], ..., scroll[159]]
+                ↓        ↓         ↓                  ↓
+ line 0:    BG2X    line 1: BG2X   ...    line 159: BG2X
+```
+
+Here the walking source pointer is the **whole point**. After 160 lines, the game uses `IncrementReload` on the destination so the *destination* snaps back at next VBlank, while the source either continues (if the next-frame's table is contiguous in memory) or gets re-anchored by the game.
+
+**Special (FIFO sound).** This is the odd one out. The game writes a **single buffer** and expects DMA to replay it on a loop while the CPU overwrites it each frame. The hardware's natural behaviour ("source advances every transfer") is *exactly wrong* for this. That's why the BIOS has a dedicated function — `SoundDriverVSync` (SWI 0x1D) — whose only job is to re-latch DMA1/DMA2 internal_sad every VBlank. It's a workaround for an architectural mismatch between FIFO DMA's source-advancement and the sample-replay use case.
+
+Hence our reset is filtered to `Special` timing only:
+
+```rust
+for ch in [1usize, 2] {
+    let c = &mut self.bus.dma.channels[ch];
+    if c.active && matches!(c.timing(), dma::DmaTiming::Special) {
+        c.internal_sad = c.sad & 0x07FF_FFFF;
+    }
+}
+```
+
+We don't touch HBlank-timed DMA channels (the HDMA scroll-table use case would break). We don't touch VBlank-timed DMA either — games handle their own re-latching there, and unconditionally snapping `internal_sad` could break long copies that intentionally span multiple VBlanks. We only fix what the BIOS's `SoundDriverVSync` would have fixed.
 
 ## Where this lives in code
 
