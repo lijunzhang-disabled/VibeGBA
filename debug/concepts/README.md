@@ -11,6 +11,7 @@ Each file is one self-contained topic. Add a new file when you find yourself re-
 | The big picture: what an emulator actually is, what we build, and how it ticks | [emulator-basics.md](emulator-basics.md) |
 | The event scheduler — priority queue that drives the main loop | [scheduler.md](scheduler.md) |
 | HBlank / VBlank — what they are, where they come from, why every GBA game's main loop pivots on them | [blanking-periods.md](blanking-periods.md) |
+| Memory map — IWRAM, EWRAM, VRAM, BIOS, mirroring rules, wait states | [memory-map.md](memory-map.md) |
 | DMA register model — SAD/DAD/FIFO meaning, the two-register pattern (`sad` vs `internal_sad`), and why GBA DMA looks primitive next to modern queue-based DMA | [dma-registers.md](dma-registers.md) |
 | DirectSound FIFO DMA + the VBlank reset hook | [fifo-dma-vblank.md](fifo-dma-vblank.md) |
 

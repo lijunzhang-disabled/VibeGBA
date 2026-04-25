@@ -21,13 +21,15 @@ Every 280,896 cycles = one frame = ~16.7 ms of real time. Output the framebuffer
 
 **Memory bus** — A giant switch statement keyed on the top byte of the address:
 - `0x00xxxxxx` → BIOS
-- `0x02xxxxxx` → External RAM
-- `0x03xxxxxx` → Internal RAM
+- `0x02xxxxxx` → EWRAM (External Work RAM, 256 KB, slow)
+- `0x03xxxxxx` → IWRAM (Internal Work RAM, 32 KB, fast)
 - `0x04xxxxxx` → I/O registers (writing here triggers hardware behavior — e.g., writing to DMA control starts a transfer)
 - `0x05xxxxxx` → Palette
 - `0x06xxxxxx` → Video RAM
-- `0x07xxxxxx` → Sprite attributes
+- `0x07xxxxxx` → Sprite attributes (OAM)
 - `0x08xxxxxx` → Game cartridge ROM
+
+See [memory-map.md](memory-map.md) for the full table, sizes, and mirroring rules.
 
 **PPU (video)** — Renders the screen one scanline at a time. Given the current video mode (tile-based or bitmap), it reads tile maps from VRAM, looks up colors in the palette, applies scrolling/rotation/blending/windowing, and writes 240 pixels into the framebuffer row. Called once per visible scanline (160 times per frame).
 
