@@ -22,6 +22,7 @@ See [concepts/README.md](concepts/README.md) for the full index. Current topics:
 - [emulator-basics](concepts/emulator-basics.md) — what the emulator does at a high level, frame loop, components.
 - [scheduler](concepts/scheduler.md) — the priority-queue event dispatcher.
 - [blanking-periods](concepts/blanking-periods.md) — HBlank, VBlank, and why they matter.
+- [dma-registers](concepts/dma-registers.md) — SAD/DAD/FIFO meaning, two-register pattern, contrast with modern queue-based DMA.
 - [fifo-dma-vblank](concepts/fifo-dma-vblank.md) — DirectSound FIFO DMA and the VBlank reset hook.
 
 ## Template

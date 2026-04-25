@@ -54,6 +54,7 @@ If you ever find a game whose audio breaks because of this auto-reset (e.g. a ga
 
 ## Related
 
+- [dma-registers.md](dma-registers.md) — SAD/DAD/FIFO terminology, `sad` vs `internal_sad`, and why GBA DMA is so different from queue-based modern DMA.
 - [blanking-periods.md](blanking-periods.md) — what VBlank actually is.
 - [scheduler.md](scheduler.md) — how the VBlank moment is dispatched (`HBlankEnd` event, `line == 160` branch).
 - `../2026-04-25_pokemon-audio-dma-reanchor.md` — full investigation log that led to this auto-reset.
