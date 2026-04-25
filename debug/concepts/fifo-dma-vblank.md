@@ -55,6 +55,7 @@ If you ever find a game whose audio breaks because of this auto-reset (e.g. a ga
 ## Related
 
 - [dma-registers.md](dma-registers.md) — SAD/DAD/FIFO terminology, `sad` vs `internal_sad`, and why GBA DMA is so different from queue-based modern DMA.
+- [timers.md](timers.md) — what "Timer 0 overflow" means and how the reload value sets the audio sample rate.
 - [memory-map.md](memory-map.md) — IWRAM mirroring is the reason DMA reads "garbage" instead of just crashing when it walks past the buffer.
 - [blanking-periods.md](blanking-periods.md) — what VBlank actually is.
 - [scheduler.md](scheduler.md) — how the VBlank moment is dispatched (`HBlankEnd` event, `line == 160` branch).

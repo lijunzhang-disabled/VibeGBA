@@ -23,6 +23,7 @@ See [concepts/README.md](concepts/README.md) for the full index. Current topics:
 - [scheduler](concepts/scheduler.md) — the priority-queue event dispatcher.
 - [blanking-periods](concepts/blanking-periods.md) — HBlank, VBlank, and why they matter.
 - [memory-map](concepts/memory-map.md) — IWRAM/EWRAM/VRAM, the full address layout, mirroring rules.
+- [timers](concepts/timers.md) — counter/reload/prescaler/cascade, what overflow means, how audio sample rates are generated.
 - [dma-registers](concepts/dma-registers.md) — SAD/DAD/FIFO meaning, two-register pattern, contrast with modern queue-based DMA.
 - [fifo-dma-vblank](concepts/fifo-dma-vblank.md) — DirectSound FIFO DMA and the VBlank reset hook.
 

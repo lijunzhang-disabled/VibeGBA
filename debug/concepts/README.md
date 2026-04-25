@@ -12,6 +12,7 @@ Each file is one self-contained topic. Add a new file when you find yourself re-
 | The event scheduler — priority queue that drives the main loop | [scheduler.md](scheduler.md) |
 | HBlank / VBlank — what they are, where they come from, why every GBA game's main loop pivots on them | [blanking-periods.md](blanking-periods.md) |
 | Memory map — IWRAM, EWRAM, VRAM, BIOS, mirroring rules, wait states | [memory-map.md](memory-map.md) |
+| Timers — counter/reload/prescaler/cascade, what "overflow" means, how it generates audio sample clocks and frame timing | [timers.md](timers.md) |
 | DMA register model — SAD/DAD/FIFO meaning, the two-register pattern (`sad` vs `internal_sad`), and why GBA DMA looks primitive next to modern queue-based DMA | [dma-registers.md](dma-registers.md) |
 | DirectSound FIFO DMA + the VBlank reset hook | [fifo-dma-vblank.md](fifo-dma-vblank.md) |
 
