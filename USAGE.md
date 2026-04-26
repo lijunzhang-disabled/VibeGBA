@@ -102,30 +102,6 @@ The save type is auto-detected from strings embedded in the ROM:
 | `FLASH1M_V` | Flash | 128 KB |
 | `EEPROM_V` | EEPROM | 512 B or 8 KB |
 
-#### Automatic backups
-
-Whenever the emulator writes a `.sav` and the data has actually changed,
-it rotates a 5-deep history of backups next to the file:
-
-```
-pokemon_emerald.sav         ← current (just-written)
-pokemon_emerald.sav.bak-1   ← previous
-pokemon_emerald.sav.bak-2   ← one before that
-…
-pokemon_emerald.sav.bak-5   ← oldest kept
-```
-
-If you ever lose progress (corrupted save, accidental overwrite, etc.),
-restore by copying a backup over the live file:
-
-```bash
-cp pokemon_emerald.sav.bak-1 pokemon_emerald.sav
-```
-
-Backups only rotate when the save data actually changes — purely opening
-and closing the emulator without any in-game save is a no-op and won't
-push older backups out of the window.
-
 ### Save States (.state)
 
 Save states capture the **entire emulator state** — CPU, memory, video, audio, everything — at a single instant. Unlike game saves, they work regardless of whether the game has a save feature.
