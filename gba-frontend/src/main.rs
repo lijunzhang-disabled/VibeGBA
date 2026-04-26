@@ -66,11 +66,54 @@ fn load_sav(gba: &mut Gba, path: &Path) {
     }
 }
 
-/// Save .sav file.
+/// Append `.bak-N` to a save path. e.g. `Pokemon.sav` → `Pokemon.sav.bak-1`.
+fn backup_path(path: &Path, n: u32) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(format!(".bak-{}", n));
+    PathBuf::from(s)
+}
+
+/// Rotate `slots` backup files: bak-{slots-1} → bak-{slots} (oldest dropped),
+/// …, bak-1 → bak-2, current `.sav` → `.bak-1`. Missing files are silently
+/// skipped — first save just creates `.bak-1`, second creates `.bak-2`, etc.
+fn rotate_sav_backups(path: &Path, slots: u32) {
+    if slots == 0 {
+        return;
+    }
+    // Drop the oldest slot (it's about to be overwritten by slot-1's data).
+    let _ = fs::remove_file(backup_path(path, slots));
+    // Shift slots: bak-(N-1) → bak-N for N down to 2.
+    for n in (1..slots).rev() {
+        let src = backup_path(path, n);
+        let dst = backup_path(path, n + 1);
+        let _ = fs::rename(&src, &dst);
+    }
+    // Move current .sav → .bak-1 (if it exists).
+    if path.exists() {
+        let bak1 = backup_path(path, 1);
+        let _ = fs::rename(path, &bak1);
+    }
+}
+
+/// Save `.sav` file. If the new save is different from what's already on
+/// disk, rotate the backup files (.bak-1 .. .bak-N) before writing. This
+/// keeps a 5-deep history of meaningful save changes; pure open-and-close
+/// cycles with no in-game save are no-ops and don't fill the slots.
 fn save_sav(gba: &Gba, path: &Path) {
+    const BACKUP_SLOTS: u32 = 5;
     if let Some(data) = gba.export_save() {
+        // Skip the rotate-and-write entirely if the file already matches.
+        // This is what protects backup slots from being clobbered when the
+        // user just opens the emulator and quits without playing.
+        if let Ok(existing) = fs::read(path) {
+            if existing == data {
+                return;
+            }
+        }
+        rotate_sav_backups(path, BACKUP_SLOTS);
         match fs::write(path, &data) {
-            Ok(()) => eprintln!("Saved to {}", path.display()),
+            Ok(()) => eprintln!("Saved to {} (rotated 1 backup, kept up to {})",
+                path.display(), BACKUP_SLOTS),
             Err(e) => eprintln!("Failed to write save: {}", e),
         }
     }
