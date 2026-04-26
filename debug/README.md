@@ -14,7 +14,7 @@ This folder stores two kinds of documents:
 | 2026-04-24 | [ARM MSR: mode-bit banking was silently skipped](2026-04-24_arm-msr-banking.md) | **Fixed** |
 | 2026-04-24 | [CPU accuracy sweep — 5 fixes from jsmolka test ROMs](2026-04-24_cpu-accuracy-sweep.md) | **In progress** |
 | 2026-04-25 | [Pokémon audio: FIFO DMA must be re-anchored every VBlank](2026-04-25_pokemon-audio-dma-reanchor.md) | **Fixed** (behavioural) |
-| 2026-04-26 | [Pokémon Emerald save hangs: nested-IRQ banking corruption](2026-04-26_pokemon-save-irq-banking.md) | **In progress** (root cause identified) |
+| 2026-04-26 | [Pokémon Emerald save: 8-bit Flash bus + chip ID](2026-04-26_pokemon-save-irq-banking.md) | **Fixed** |
 
 ## Concept notes
 

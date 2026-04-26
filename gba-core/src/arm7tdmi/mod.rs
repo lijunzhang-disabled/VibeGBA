@@ -585,4 +585,120 @@ mod tests {
         assert_eq!(cpu.regs[13], 0x1234);
         assert_eq!(cpu.regs[14], 0x5678);
     }
+
+    /// The full Pokémon scenario: handler is in IRQ mode with pushed
+    /// state, switches to System with IRQ ENABLED, a NESTED IRQ fires
+    /// while in System mode. The nested IRQ must not corrupt the
+    /// outer handler's SP_irq.
+    #[test]
+    fn test_sp_irq_preserved_with_nested_irq() {
+        use crate::bus::Bus;
+        let mut cpu = Cpu::new();
+        cpu.cpsr = Psr::new(CpuMode::Irq);
+        cpu.cpsr.bits |= 1 << 7;
+        cpu.regs[13] = 0x03007F74;
+        cpu.banked.sp[CpuMode::System.bank_index()] = 0x03007E20;
+        let mut bus = Bus::new(None, vec![0u8; 0x100]);
+
+        // Step A: outer handler MSR to System (with IRQs enabled).
+        cpu.regs[3] = 0x4000_001F;
+        cpu.execute_arm(&mut bus, 0xE129_F003);
+        assert_eq!(cpu.cpsr.mode(), CpuMode::System);
+
+        // Step B: nested IRQ fires. handle_interrupt simulates that.
+        cpu.handle_interrupt(&mut bus);
+        assert_eq!(cpu.cpsr.mode(), CpuMode::Irq);
+        // We're in IRQ mode now with SP_irq loaded from banked.sp[Irq],
+        // which should be 0x03007F74 (the post-push value from outer
+        // handler).
+        assert_eq!(cpu.regs[13], 0x03007F74,
+            "nested IRQ entry: SP_irq should be outer handler's pushed value");
+
+        // Pretend nested handler does some pushing.
+        cpu.regs[13] -= 24; // nested BIOS push (6 regs)
+
+        // Nested handler returns: switch_mode back to System (matches
+        // SUBS PC,LR,#4 with SPSR_irq.mode() = System).
+        // Manually do what set_reg_with_flags would do for an exception
+        // return: switch to the SPSR's mode, then assign cpsr=spsr.
+        let saved_spsr = cpu.spsr();
+        cpu.switch_mode(saved_spsr.mode());
+        cpu.cpsr = saved_spsr;
+        assert_eq!(cpu.cpsr.mode(), CpuMode::System);
+
+        // Step C: outer handler MSR back to IRQ.
+        cpu.regs[3] = 0x4000_0092;
+        cpu.execute_arm(&mut bus, 0xE129_F003);
+        assert_eq!(cpu.cpsr.mode(), CpuMode::Irq);
+        // SP_irq should match the value we set after step B (0x03007F5C).
+        assert_eq!(cpu.regs[13], 0x03007F5C,
+            "after nested IRQ + outer MSR back: SP_irq wrong");
+    }
+
+    /// Same round-trip but driven by actual MSR instructions executed
+    /// through `arm_msr`, matching the path Pokémon's IRQ handler takes.
+    #[test]
+    fn test_sp_irq_preserved_through_msr_round_trip() {
+        use crate::bus::Bus;
+        let mut cpu = Cpu::new();
+        cpu.cpsr = Psr::new(CpuMode::Irq);
+        cpu.cpsr.bits |= 1 << 7; // IRQ disabled (in IRQ handler)
+        cpu.regs[13] = 0x03007F74;
+        cpu.banked.sp[CpuMode::System.bank_index()] = 0x03007E20;
+
+        // Tiny ROM is enough — arm_msr doesn't touch the bus.
+        let mut bus = Bus::new(None, vec![0u8; 0x100]);
+
+        // Encode `MSR CPSR_fc, R3` (E129F003).
+        // Then set R3 to System-mode CPSR (0x4000001F: System, IRQ enabled).
+        cpu.regs[3] = 0x4000_001F;
+        cpu.execute_arm(&mut bus, 0xE129_F003);
+        assert_eq!(cpu.cpsr.mode(), CpuMode::System);
+        assert_eq!(cpu.regs[13], 0x03007E20);
+
+        // Pretend we did some work in System mode — push something.
+        cpu.regs[13] = 0x03007D00;
+
+        // Now MSR back to IRQ mode (R3 = 0x40000092: IRQ, IRQ disabled).
+        cpu.regs[3] = 0x4000_0092;
+        cpu.execute_arm(&mut bus, 0xE129_F003);
+        assert_eq!(cpu.cpsr.mode(), CpuMode::Irq);
+        assert_eq!(cpu.regs[13], 0x03007F74,
+            "SP_irq corrupted across IRQ→System→IRQ via MSR");
+    }
+
+    /// Regression: Pokémon Emerald in-game save hangs because its IRQ
+    /// handler does:
+    ///   1. (IRQ mode) push regs → SP_irq goes down
+    ///   2. MSR back to System → switch_mode saves SP_irq, loads SP_sys
+    ///   3. (System mode) work, SP_sys may move
+    ///   4. MSR to IRQ → switch_mode saves SP_sys, loads SP_irq
+    ///   5. (IRQ mode) pop regs → SP_irq must equal value from step 1
+    ///
+    /// SP_irq must be preserved across the System-mode round-trip.
+    #[test]
+    fn test_sp_irq_preserved_across_round_trip() {
+        let mut cpu = Cpu::new();
+        cpu.cpsr = Psr::new(CpuMode::Irq);
+        // Initial IRQ SP after some pushes.
+        cpu.regs[13] = 0x03007F74;
+        // Initial System SP value to load when we switch.
+        cpu.banked.sp[CpuMode::System.bank_index()] = 0x03007E20;
+
+        // Step: IRQ → System
+        cpu.switch_mode(CpuMode::System);
+        assert_eq!(cpu.cpsr.mode(), CpuMode::System);
+        assert_eq!(cpu.regs[13], 0x03007E20);
+
+        // System mode work — SP changes
+        cpu.regs[13] = 0x03007D00;
+
+        // Step: System → IRQ
+        cpu.switch_mode(CpuMode::Irq);
+        assert_eq!(cpu.cpsr.mode(), CpuMode::Irq);
+        // KEY ASSERTION: SP_irq must be the post-push value from step 1,
+        // not anything else.
+        assert_eq!(cpu.regs[13], 0x03007F74,
+            "SP_irq corrupted across IRQ→System→IRQ round trip");
+    }
 }

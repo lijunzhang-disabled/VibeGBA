@@ -1,7 +1,7 @@
-# Pokémon Emerald in-game save: nested-IRQ banking corruption
+# Pokémon Emerald in-game save: 8-bit Flash bus + chip ID
 
 Date: 2026-04-26
-Status: **In progress** (root cause identified, fix pending)
+Status: **Fixed**
 
 ## Symptom
 
@@ -75,20 +75,56 @@ The handler pushed at `SP_irq = 0x03007F88`, leaving data at
 handler's push size). LDMFD reads from the **wrong addresses** and
 gets garbage.
 
-### Root cause hypothesis
+### Initial hypothesis (turned out wrong)
 
-Pokémon enables IRQs again in step 3 (`R3 = 0x4000001F`, bit 7 = 0
-clears the IRQ-disable bit). Nested VBlank IRQs can fire during the
-System-mode portion of the user handler. Each nested IRQ entry/exit
-goes through `switch_mode` → updates `banked.sp[Irq]`. Somewhere in
-that chain we save the wrong value back, so when the original
-handler eventually switches `System → Irq` at `0x0300288C`, it
-restores `SP_irq` to the BIOS-push level instead of the user-push
-level.
+We hypothesised this was a nested-IRQ banking bug — Pokémon's handler
+re-enables IRQs in System mode, allowing nested VBlank IRQs to fire,
+and our `switch_mode` was thought to be corrupting `banked.sp[Irq]`
+across the nested round-trip.
 
-This is the same *family* of bug as the MSR banking issue we fixed
-during the audio investigation (see
-`2026-04-24_arm-msr-banking.md`), but in a different code path.
+We wrote unit tests for the IRQ→System→IRQ cycle (with and without
+nested IRQs) and they all **passed**. We then added `BANK_TRACE`
+instrumentation that printed `banked.sp[Irq]` on every `switch_mode`
+call. The trace showed `banked.sp[Irq]` oscillating cleanly between
+`0x03007F74` (post-push) and `0x03007FA0` (post-pop) every IRQ
+cycle — exactly the correct pattern. **No banking bug.** The
+"escape" we'd seen earlier was a side effect, not the cause.
+
+### Actual root cause
+
+Two unrelated 8-bit-bus bugs in the SRAM/Flash region.
+
+GBA cartridge SRAM/Flash sits on an 8-bit bus. Per gbatek, wider
+accesses behave specifically:
+- **Reads**: the byte at the LSB position is broadcast to all
+  positions of the result (16-bit gets `byte | byte<<8`, 32-bit gets
+  `byte | byte<<8 | byte<<16 | byte<<24`).
+- **Writes**: only the byte at the LSB position is stored.
+
+Our emulator was wrong on **both**:
+
+1. **`bus::read16` / `read32`** of the `0x0E…/0x0F…` region read
+   *consecutive* bytes (so a 16-bit read of address X returned
+   `flash[X] | flash[X+1]<<8`). This corrupted any wider load of
+   flash by Pokémon's checksum-verify routine — it computed against
+   data that didn't match what was actually there. Pokémon decided
+   the save was corrupt and erased it on reload.
+
+2. **`bus::write16` / `write32`** of the same region were silently
+   *dropped*. (Writes to that region only matched on `0x08..=0x0D`
+   for ROM/GPIO and fell through for `0x0E..=0x0F`.) This was a
+   second-order issue: if Pokémon ever stored a halfword/word into
+   the save buffer, only the byte that 8-bit bus would have stored
+   was actually expected to land — but our code dropped the whole
+   thing. **Adding back the low-byte store turned out to break some
+   other path** (re-enabling it caused a fresh hang). After the
+   read fix, Pokémon's save apparently doesn't actually depend on
+   the write path picking up halfword/word stores; reverting the
+   write change made everything work.
+
+So the load-bearing fix was the **read broadcast** in step 1. The
+write fallthrough is left as `_ => {}` for now (matches the prior
+behaviour and unblocks Pokémon).
 
 ## Fixes applied so far
 
@@ -111,29 +147,37 @@ during the audio investigation (see
 - **`DUMP_PC=1`**: per-frame PC sampler in the frontend with mode,
   IRQ state, R0–R3, SP, LR.
 
-## Open questions
+## Verification
 
-- Where exactly in `switch_mode` does the wrong `banked.sp[Irq]`
-  value come from? Need an `eprintln!` of `banked.sp[Irq]` before
-  and after each `switch_mode` call to pin down.
-- Is it specifically the nested-IRQ path, or does the bug exist in
-  any IRQ-mode → System-mode → IRQ-mode round trip even without
-  nesting? We should be able to reproduce headlessly by manually
-  invoking the same MSR sequence.
+- After the read-broadcast fix:
+  - In-game save completes, `.sav` file has all 14 sectors with
+    valid 0x08012025 signatures and matching checksums.
+  - On reload, "Continue" appears at the title screen — the save
+    survives the round-trip.
+- Test ROMs unchanged: arm.gba / thumb.gba / memory.gba all-pass,
+  bios.gba still fails test 001 (unrelated stale-bus quirk).
+- All 90 unit tests pass.
 
-## Next steps
+## Lessons learned
 
-1. Add explicit `banked.sp[Irq]` tracing inside `switch_mode` so we
-   can see when it diverges from the expected value.
-2. Construct a unit test that reproduces the round-trip:
-   `IRQ-mode push X → switch System → switch IRQ → expect SP unchanged`.
-3. Once fixed, expect this to also improve audio (the bug may explain
-   some of the residual noise from the audio fix — same mechanism
-   could subtly corrupt other state).
+1. **Don't trust the first plausible hypothesis.** "Banking bug"
+   matched the symptom (CPU escape during save) but the unit tests
+   we wrote to validate it all passed. The real bug was much simpler
+   and lower in the stack.
+2. **Diagnostic instrumentation pays for itself.** The
+   `INSTR_TRACE_RING` (256-entry ring frozen on first invalid PC),
+   `IRQ_TRACE`, `FLASH_TRACE`, and `DUMP_PC` env-gated dumps were
+   all left in place — they're each useful again next time a game
+   misbehaves. None of them affect runtime when the env var is unset.
+3. **Per-sector checksum analysis is a great endgame check.** Once
+   `.sav` is on disk, a small Python script that recomputes Pokémon's
+   per-sector checksum and compares to the stored value pinpointed
+   "13 sectors valid, 1 not" — that reframed the problem from "save
+   is broken" to "specific bytes in specific sectors are wrong".
 
 ## Related
 
 - [`2026-04-24_arm-msr-banking.md`](2026-04-24_arm-msr-banking.md) —
-  earlier MSR/banking bug we fixed.
-- [`concepts/dma-registers.md`](concepts/dma-registers.md) — banking
-  concept generalises here too (programmed value vs runtime cursor).
+  earlier real banking bug.
+- [`concepts/memory-map.md`](concepts/memory-map.md) — explains the
+  memory regions including the 8-bit-bus property of SRAM/Flash.
