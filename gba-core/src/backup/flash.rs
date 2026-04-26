@@ -13,6 +13,27 @@
 //!   0xB0 — Bank switch (128KB only: next write to 0x0000 selects bank 0 or 1)
 
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
+use std::sync::Mutex;
+
+static TRACE_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+fn trace_log(msg: &str) {
+    if std::env::var("FLASH_TRACE").is_err() {
+        return;
+    }
+    let mut guard = TRACE_FILE.lock().unwrap();
+    if guard.is_none() {
+        let path = std::env::var("FLASH_TRACE_FILE").unwrap_or_else(|_| "/tmp/flash.log".to_string());
+        if let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&path) {
+            *guard = Some(f);
+        }
+    }
+    if let Some(f) = guard.as_mut() {
+        let _ = writeln!(f, "[FLASH] {}", msg);
+        let _ = f.flush();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum FlashState {
@@ -52,11 +73,15 @@ impl Flash {
     }
 
     /// Manufacturer + Device ID for chip identification.
+    /// Use Macronix (most common in real cartridges, esp. Pokémon Emerald)
+    /// rather than Sanyo — Pokémon's per-chip save routines have a Sanyo
+    /// status-polling path that we don't emulate, causing in-game saves to
+    /// hang. See debug bug record for the investigation.
     fn chip_id(&self) -> (u8, u8) {
         if self.is_128k() {
-            (0x62, 0x13) // Sanyo 128KB
+            (0xC2, 0x09) // Macronix MX29L1100B (1 Mbit / 128 KB)
         } else {
-            (0x1F, 0x3D) // Atmel 64KB
+            (0x1F, 0x3D) // Atmel AT29LV512 (64 KB)
         }
     }
 
@@ -69,23 +94,30 @@ impl Flash {
 
         if self.state == FlashState::ChipId {
             let (manufacturer, device) = self.chip_id();
-            return match offset {
+            let v = match offset {
                 0 => manufacturer,
                 1 => device,
                 _ => 0,
             };
+            trace_log(&format!("CHIP-ID read 0x{:04X} → 0x{:02X}", offset, v));
+            return v;
         }
 
         let index = self.bank_offset() + offset;
-        if index < self.data.len() {
-            self.data[index]
-        } else {
-            0xFF
+        let v = if index < self.data.len() { self.data[index] } else { 0xFF };
+        if std::env::var("FLASH_TRACE_READS").is_ok() {
+            trace_log(&format!("read 0x{:04X} → 0x{:02X}  bank={}", offset, v, self.bank));
         }
+        v
     }
 
     pub fn write(&mut self, addr: u32, val: u8) {
         let offset = (addr & 0xFFFF) as usize;
+
+        trace_log(&format!(
+            "state={:?} write 0x{:04X} = 0x{:02X}  bank={}",
+            self.state, offset, val, self.bank
+        ));
 
         match self.state {
             FlashState::Ready => {

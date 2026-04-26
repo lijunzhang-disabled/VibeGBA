@@ -163,6 +163,12 @@ fn main() {
     let mut audio_tmp = vec![0i16; 4096];
     let mut test_buf = vec![0u16; 240 * 160];
 
+    // PC-hot-loop sampler: when DUMP_PC=1, every 120 frames (~2s) print
+    // the most-frequent PC and IRQ-disabled state from the last frame.
+    // Useful for finding where the CPU is stuck during in-game save.
+    let dump_pc = std::env::var("DUMP_PC").is_ok();
+    let mut frame_count: u64 = 0;
+
     // Main emulation loop
     'running: loop {
         let frame_start = Instant::now();
@@ -226,6 +232,48 @@ fn main() {
                 }
             }
             display.render(gba.framebuffer());
+
+            if dump_pc {
+                frame_count += 1;
+                // Sample more aggressively (every 30 frames = 0.5s) and ALSO
+                // every frame once we detect PC is in unmapped memory.
+                let thumb = gba.cpu.cpsr.thumb();
+                let pc = if gba.cpu.pipeline_flushed {
+                    gba.cpu.regs[15]
+                } else if thumb {
+                    gba.cpu.regs[15].wrapping_sub(4)
+                } else {
+                    gba.cpu.regs[15].wrapping_sub(8)
+                };
+                let pc_in_valid = matches!(pc >> 24, 0x00 | 0x02 | 0x03 | 0x08 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D);
+                if std::env::var("INSTR_TRACE_RING").is_ok() && gba_core::trace_is_frozen() {
+                    static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("=== ESCAPE DETECTED: PC=0x{:08X} mode={:?} thumb={} sp=0x{:08X} lr=0x{:08X} ===",
+                            pc, gba.cpu.cpsr.mode(), thumb, gba.cpu.regs[13], gba.cpu.regs[14]);
+                        gba_core::dump_trace_ring();
+                        eprintln!("=== END TRACE — exiting ===");
+                        break 'running;
+                    }
+                }
+                let want_dump = frame_count % 30 == 0 || (!pc_in_valid && frame_count % 5 == 0);
+                if want_dump {
+                    eprintln!(
+                        "[PC] f={} pc=0x{:08X} {} mode={:?} irq_dis={} halt={} valid={} ie=0x{:04X} ir=0x{:04X} ime={} | r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} sp=0x{:08X} lr=0x{:08X}",
+                        frame_count, pc,
+                        if thumb {"T"} else {"A"},
+                        gba.cpu.cpsr.mode(),
+                        gba.cpu.cpsr.irq_disabled(),
+                        gba.cpu.halted,
+                        pc_in_valid,
+                        gba.bus.interrupt.ie,
+                        gba.bus.interrupt.ir,
+                        gba.bus.interrupt.ime,
+                        gba.cpu.regs[0], gba.cpu.regs[1], gba.cpu.regs[2], gba.cpu.regs[3],
+                        gba.cpu.regs[13], gba.cpu.regs[14],
+                    );
+                }
+            }
         }
 
         // Pacing: audio-synced if audio enabled, else wall-clock 60 Hz.

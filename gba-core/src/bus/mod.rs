@@ -136,9 +136,10 @@ impl Bus {
             }
             0x08..=0x0D => self.read_rom16(addr),
             0x0E..=0x0F => {
-                let lo = self.backup.read(addr & 0xFFFF) as u16;
-                let hi = self.backup.read((addr + 1) & 0xFFFF) as u16;
-                lo | (hi << 8)
+                // SRAM/Flash is on an 8-bit bus: 16-bit reads broadcast the
+                // single byte to both halves of the result.
+                let b = self.backup.read(addr & 0xFFFF) as u16;
+                b | (b << 8)
             }
             _ => self.last_read as u16,
         };
@@ -201,6 +202,12 @@ impl Bus {
                 let lo = self.read_rom16(addr) as u32;
                 let hi = self.read_rom16(addr + 2) as u32;
                 lo | (hi << 16)
+            }
+            0x0E..=0x0F => {
+                // SRAM/Flash is on an 8-bit bus: 32-bit reads broadcast the
+                // single byte to all four positions of the result.
+                let b = self.backup.read(addr & 0xFFFF) as u32;
+                b | (b << 8) | (b << 16) | (b << 24)
             }
             _ => {
                 // Fall through: read two 16-bit values

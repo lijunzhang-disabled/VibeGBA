@@ -11,6 +11,92 @@ pub mod keypad;
 pub mod rtc;
 pub mod scheduler;
 
+// ─── Instruction-trace ring buffer (debug only) ─────────────────────
+//
+// When INSTR_TRACE_RING=1, every CPU step pushes a record into a fixed-size
+// ring. When the CPU escapes (PC goes outside valid memory), the frontend
+// can call dump_trace_ring() to print the last N instructions executed.
+
+use std::sync::Mutex;
+
+#[derive(Clone, Copy, Default)]
+pub struct TraceEntry {
+    pub pc: u32,
+    pub op: u32,
+    pub thumb: bool,
+    pub r0: u32, pub r1: u32, pub r2: u32, pub r3: u32,
+    pub sp: u32, pub lr: u32,
+}
+
+const TRACE_RING_SIZE: usize = 256;
+static TRACE_RING: Mutex<Option<Box<[TraceEntry; TRACE_RING_SIZE]>>> = Mutex::new(None);
+static TRACE_HEAD: Mutex<usize> = Mutex::new(0);
+static TRACE_FROZEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn pc_in_valid_code(pc: u32) -> bool {
+    matches!(pc >> 24, 0x00 | 0x02 | 0x03 | 0x08 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D)
+}
+
+fn ensure_ring() {
+    let mut g = TRACE_RING.lock().unwrap();
+    if g.is_none() {
+        *g = Some(Box::new([TraceEntry::default(); TRACE_RING_SIZE]));
+    }
+}
+
+pub fn push_trace_thumb(pc: u32, op: u16, r0: u32, r1: u32, r2: u32, r3: u32, sp: u32, lr: u32) {
+    if TRACE_FROZEN.load(std::sync::atomic::Ordering::Relaxed) { return; }
+    ensure_ring();
+    if !pc_in_valid_code(pc) {
+        // First invalid PC — freeze the ring so the dump captures the
+        // last 256 valid instructions BEFORE the escape.
+        TRACE_FROZEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Push the escape entry too so we can see the bad target.
+    }
+    let mut head = TRACE_HEAD.lock().unwrap();
+    let mut ring = TRACE_RING.lock().unwrap();
+    if let Some(r) = ring.as_mut() {
+        r[*head] = TraceEntry { pc, op: op as u32, thumb: true, r0, r1, r2, r3, sp, lr };
+        *head = (*head + 1) % TRACE_RING_SIZE;
+    }
+}
+
+pub fn push_trace_arm(pc: u32, op: u32, r0: u32, r1: u32, r2: u32, r3: u32, sp: u32, lr: u32) {
+    if TRACE_FROZEN.load(std::sync::atomic::Ordering::Relaxed) { return; }
+    ensure_ring();
+    if !pc_in_valid_code(pc) {
+        TRACE_FROZEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut head = TRACE_HEAD.lock().unwrap();
+    let mut ring = TRACE_RING.lock().unwrap();
+    if let Some(r) = ring.as_mut() {
+        r[*head] = TraceEntry { pc, op, thumb: false, r0, r1, r2, r3, sp, lr };
+        *head = (*head + 1) % TRACE_RING_SIZE;
+    }
+}
+
+pub fn trace_is_frozen() -> bool {
+    TRACE_FROZEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn dump_trace_ring() {
+    let head = *TRACE_HEAD.lock().unwrap();
+    let ring = TRACE_RING.lock().unwrap();
+    if let Some(r) = ring.as_ref() {
+        eprintln!("=== Last {} CPU instructions (oldest first): ===", TRACE_RING_SIZE);
+        for i in 0..TRACE_RING_SIZE {
+            let idx = (head + i) % TRACE_RING_SIZE;
+            let e = r[idx];
+            if e.pc == 0 && e.op == 0 { continue; }
+            eprintln!(
+                "  PC=0x{:08X} {} op=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} sp=0x{:08X} lr=0x{:08X}",
+                e.pc, if e.thumb {"T"} else {"A"}, e.op,
+                e.r0, e.r1, e.r2, e.r3, e.sp, e.lr,
+            );
+        }
+    }
+}
+
 use arm7tdmi::Cpu;
 use bus::Bus;
 use dma::DmaTiming;

@@ -200,6 +200,12 @@ impl Cpu {
     }
 
     fn step_arm(&mut self, bus: &mut Bus) -> u32 {
+        if std::env::var("INSTR_TRACE_RING").is_ok() {
+            let pc = self.regs[15].wrapping_sub(8);
+            crate::push_trace_arm(pc, self.pipeline[0],
+                self.regs[0], self.regs[1], self.regs[2], self.regs[3],
+                self.regs[13], self.regs[14]);
+        }
         // Invariant: at start of step, regs[15] = executing_instruction_address + 8.
         // This matches the ARM7TDMI spec where PC reads during execution return PC+8.
         let opcode = self.pipeline[0];
@@ -225,6 +231,15 @@ impl Cpu {
     fn step_thumb(&mut self, bus: &mut Bus) -> u32 {
         // Invariant: at start of step, regs[15] = executing_instruction_address + 4.
         let opcode = self.pipeline[0] as u16;
+
+        // Ring-buffer trace of last N THUMB instructions. When PC escapes to
+        // unmapped memory, we'll dump the buffer.
+        if std::env::var("INSTR_TRACE_RING").is_ok() {
+            let pc = self.regs[15].wrapping_sub(4);
+            crate::push_trace_thumb(pc, opcode,
+                self.regs[0], self.regs[1], self.regs[2], self.regs[3],
+                self.regs[13], self.regs[14]);
+        }
 
         let cycles = self.execute_thumb(bus, opcode);
 
@@ -361,6 +376,10 @@ impl Cpu {
 
         // Save CPSR to SPSR_irq
         let saved_cpsr = self.cpsr;
+        if std::env::var("IRQ_TRACE").is_ok() {
+            eprintln!("[IRQ] enter cpsr=0x{:08X} mode={:?} thumb={} ret=0x{:08X}",
+                saved_cpsr.bits, saved_cpsr.mode(), saved_cpsr.thumb(), return_addr);
+        }
         self.switch_mode(CpuMode::Irq);
         self.set_spsr(saved_cpsr);
 
@@ -506,6 +525,10 @@ impl Cpu {
                 // Rd=R15 with S bit: restore CPSR from SPSR, then branch
                 let spsr = self.spsr();
                 let new_mode = spsr.mode();
+                if std::env::var("IRQ_TRACE").is_ok() {
+                    eprintln!("[IRQ] return val=0x{:08X} spsr=0x{:08X} new_mode={:?} thumb={} from_mode={:?}",
+                        val, spsr.bits, new_mode, spsr.thumb(), self.cpsr.mode());
+                }
                 self.switch_mode(new_mode);
                 self.cpsr = spsr;
             }
