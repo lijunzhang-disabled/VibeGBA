@@ -35,15 +35,15 @@ Controls, save-state hotkeys, BIOS info, and troubleshooting are in [`USAGE.md`]
 | [`USAGE.md`](USAGE.md) | How to build, run, and control the emulator |
 | [`PLAN.md`](PLAN.md) | Phase-by-phase implementation plan with status |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Technical deep-dive on CPU, PPU, memory bus, scheduler, audio, save states |
-| [`debug/`](debug/) | Bug investigations and conceptual notes (e.g., how the event scheduler works) |
+| [`debug/`](debug/) | Bug investigations, [concept notes](debug/concepts/), and a rolling [followups list](debug/followups.md) |
 
 ## Status
 
 - Phases 1-7 (CPU, memory, PPU, DMA, timers, audio, saves) — **Done**
 - Phase 8 (debugger) — optional, small utilities added on demand
-- Phase 9 (accuracy polish) — ongoing; real-game bugs fixed as encountered
+- Phase 9 (accuracy polish) — ongoing; recent: Pokémon Emerald boots to title screen with music, in-game save round-trips correctly, jsmolka arm/thumb/memory test ROMs all pass
 
-83 tests passing, ~8600 lines of Rust across `gba-core` (no-std-ready library) and `gba-frontend` (SDL2 binary).
+90 tests passing, ~10,000 lines of Rust across `gba-core` (no-std-ready library) and `gba-frontend` (SDL2 binary).
 
 ## Reference
 
