@@ -1,9 +1,10 @@
 # Debug Folder
 
-This folder stores two kinds of documents:
+This folder stores three kinds of documents:
 
 1. **Bug investigations** — one markdown per bug, recording symptom → root cause → fix → verification. Named `YYYY-MM-DD_<short-slug>.md` and lives at the top of `debug/`.
 2. **Concept notes** — explanations of how parts of the emulator work, for self-reference. Lives in `debug/concepts/`, one file per topic. See [concepts/README.md](concepts/README.md) for the index.
+3. **Followups** — rolling list of known correctness gaps, accuracy items, and "we'll get to it later" notes. See [followups.md](followups.md).
 
 ## Bug index
 
