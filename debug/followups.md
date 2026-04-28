@@ -4,65 +4,32 @@ Tracking known issues, accuracy gaps, and "we'll get to it later" items
 across the emulator. Per-bug investigation logs go in dated files; this is
 the rolling list of things still worth doing.
 
-Last reviewed: **2026-04-27** (after first round of Pokémon save flakiness diagnosis).
+Last reviewed: **2026-04-29** (after fixing Pokémon save flakiness).
 
-## ⭐ NEXT SESSION: Pokémon Emerald save/play flakiness
+## ✅ RESOLVED: Pokémon Emerald save flakiness (commit b29226f)
 
-**Pick this up first.** Pokémon Emerald **sometimes** works correctly
-(boots, plays, in-game save round-trips, "Continue" works on reload) and
-**sometimes** misbehaves (mid-save hang, or soft-reset back to title
-screen during normal play). Same code, no apparent input difference,
-flaky outcome.
+Root cause: in `cpu::step()`, the IRQ check ran **before** the pipeline
+refill. After a branch (or any PC-writing instruction),
+`pipeline_flushed = true` and `regs[15]` held the raw branch target —
+not the +4/+8 pipeline-ahead value. `handle_interrupt()` reads
+`regs[15]` to compute the saved `LR_irq`, so it stored a value four
+(THUMB) or eight (ARM) bytes too low. The BIOS stub's
+`SUBS PC, LR, #4` then resumed mid-instruction at `target-4` /
+`target-8`, landing in garbage that often happened to decode as
+`BX R1` into an unmapped flash address.
 
-### What we know
-- The 8-bit-bus broadcast read fix (commit 64b04c0, 2026-04-26) is
-  *necessary* but not sufficient. Pokémon's read-back checksum needs
-  it.
-- We have one confirmed-good round-trip (.sav had 14/14 valid sectors,
-  reload showed Continue, game resumed correctly).
-- We've also seen: mid-save hang (CPU stops touching flash but no PC
-  escape — stuck in valid code waiting for something), and full
-  soft-reset to title during normal play before save was even
-  attempted.
-- The first-save-hang trace earlier showed Pokémon partway through
-  ~37k byte writes (out of ~57k expected) when activity stopped.
-- BANK_TRACE confirmed `switch_mode` is not the bug — banked.sp[Irq]
-  cycles cleanly between post-push and post-pop values every IRQ.
+Why flaky: only fires when an IRQ lands in the narrow window between a
+branch and its first post-branch instruction. With ~60 Hz vblank IRQs
+and a thousands-of-branches save loop, collision rate ended up around
+~60% (2/5 PASS pre-fix → 5/5 PASS post-fix).
 
-### Suspected causes (in rough order of likelihood)
-1. **Cycle-timing inaccuracy.** We don't model wait states (item #4
-   below). Pokémon's flash-write polling and vblank handler interact
-   on cycle boundaries. Slight inaccuracy in our cycle counts could
-   cause vblank IRQ to fire at "wrong" moment relative to flash
-   command sequence in some runs but not others.
-2. **RTC inconsistency.** We added Seiko S-3511 RTC emulation. If
-   reads of the RTC return slightly different values across runs (or
-   inconsistent within one run), Pokémon may soft-reset thinking the
-   cart RTC is malfunctioning. Worth double-checking the RTC state
-   transitions.
-3. **An undiagnosed CPU instruction edge case** that's only hit by a
-   specific Pokémon code path activated occasionally. Less likely
-   given our test ROMs all pass — but possible.
+Diagnostic helper kept in tree: `EXPERIMENT_GATE=1` blocks IRQ delivery
+while flash is mid-save. That gate is what proved the "IRQs during
+flash" hypothesis (5/5 with gate vs 2/5 without). Zero runtime impact
+unless the env var is set; useful if anything similar resurfaces.
 
-### Where to start when picking this back up
-- Run `/tmp/save_test.sh` 5–10 times and tabulate {PASS / PARTIAL /
-  BAD / EMPTY / pre-save-soft-reset}. Establish failure rate first.
-- If failure rate is high, capture FLASH_TRACE + INSTR_TRACE_RING +
-  IRQ_TRACE for one failing and one passing run. Diff them looking
-  for divergence point.
-- If failure rate is low (<20%), suspect timing — try running with a
-  fixed CPU step count instead of audio-synced (in `main.rs`) to see
-  if pacing affects flake rate. If yes → cycle accuracy.
-- The existing diagnostic infrastructure is all still in
-  (`FLASH_TRACE`, `INSTR_TRACE_RING`, `IRQ_TRACE`, `DUMP_PC`,
-  `BANK_TRACE`) — just env-set and run.
-- Working `.sav` file from the successful round-trip is preserved at
-  `~/Documents/PokemonEmeraldVersion.sav.bak-1` (or further back),
-  thanks to the rotating backup. Recoverable if needed.
-
-### Note: save state (`]`/`[`) works fine
-Whatever the flaky issue is, it's specific to the in-ROM save path,
-not our state snapshot/restore.
+The 8-bit-bus broadcast read fix (commit 64b04c0) was necessary but
+not sufficient — both fixes are needed for round-trip saves to work.
 
 ---
 
