@@ -56,6 +56,11 @@ pub struct Flash {
     bank: u8,
     /// Total size (64KB or 128KB)
     size: usize,
+    /// Cycles remaining during which `is_busy()` should return true after
+    /// the most recent write. Lets the EXPERIMENT_GATE block IRQs across
+    /// the entire save loop, not just the brief command-sequence window.
+    #[serde(default, skip)]
+    busy_cycles: u32,
 }
 
 impl Flash {
@@ -65,11 +70,24 @@ impl Flash {
             state: FlashState::Ready,
             bank: 0,
             size,
+            busy_cycles: 0,
         }
     }
 
     fn is_128k(&self) -> bool {
         self.size > 64 * 1024
+    }
+
+    /// True when flash is mid-command-sequence OR was written recently.
+    /// Used by an experimental IRQ gate to test whether vblank IRQs during
+    /// Pokémon's flash save loop are corrupting state.
+    pub fn is_busy(&self) -> bool {
+        self.state != FlashState::Ready || self.busy_cycles > 0
+    }
+
+    /// Decrement the sticky-busy counter as CPU cycles elapse.
+    pub fn tick(&mut self, cycles: u32) {
+        self.busy_cycles = self.busy_cycles.saturating_sub(cycles);
     }
 
     /// Manufacturer + Device ID for chip identification.
@@ -113,6 +131,11 @@ impl Flash {
 
     pub fn write(&mut self, addr: u32, val: u8) {
         let offset = (addr & 0xFFFF) as usize;
+
+        // Sticky window: keep is_busy() true for ~200k cycles after any
+        // write, so the EXPERIMENT_GATE can hold IRQs across the entire
+        // save loop (Pokémon writes ~57k bytes spaced over many cycles).
+        self.busy_cycles = 200_000;
 
         trace_log(&format!(
             "state={:?} write 0x{:04X} = 0x{:02X}  bank={}",

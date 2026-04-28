@@ -176,27 +176,45 @@ impl Cpu {
 
     /// Execute one instruction. Returns the number of cycles consumed.
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
+        // Refill the pipeline BEFORE checking for IRQs. After a branch
+        // (or any instruction that wrote PC), pipeline_flushed is true and
+        // regs[15] holds the raw branch target — not the +4/+8 pipeline-
+        // ahead value. handle_interrupt() reads regs[15] to compute LR_irq
+        // and would store target-4 (THUMB) / target-8 (ARM) instead of the
+        // correct target+4 / target+4. Flaky bug: only manifests when an
+        // IRQ fires in the narrow window between a branch and its first
+        // post-branch instruction. Refilling here makes regs[15] correct.
+        if self.pipeline_flushed {
+            self.refill_pipeline(bus);
+        }
+
+        let gate_irq = std::env::var("EXPERIMENT_GATE").is_ok()
+            && bus.backup_busy();
+
         // Check for pending interrupts
-        if bus.interrupt.has_pending() && !self.cpsr.irq_disabled() {
+        if !gate_irq && bus.interrupt.has_pending() && !self.cpsr.irq_disabled() {
             self.irq_entries += 1;
             self.handle_interrupt(bus);
             self.halted = false;
         }
 
         if self.halted {
+            bus.tick_backup(1);
             return 1; // Idle cycle
         }
 
-        // Refill pipeline if needed (after branch or init)
+        // IRQ entry flushes the pipeline; refill at the vector.
         if self.pipeline_flushed {
             self.refill_pipeline(bus);
         }
 
-        if self.cpsr.thumb() {
+        let cycles = if self.cpsr.thumb() {
             self.step_thumb(bus)
         } else {
             self.step_arm(bus)
-        }
+        };
+        bus.tick_backup(cycles);
+        cycles
     }
 
     fn step_arm(&mut self, bus: &mut Bus) -> u32 {
@@ -367,7 +385,7 @@ impl Cpu {
     }
 
     /// Handle an IRQ interrupt.
-    fn handle_interrupt(&mut self, _bus: &mut Bus) {
+    fn handle_interrupt(&mut self, bus: &mut Bus) {
         let return_addr = if self.cpsr.thumb() {
             self.regs[15] // PC is already ahead by 4 in THUMB
         } else {
@@ -377,8 +395,9 @@ impl Cpu {
         // Save CPSR to SPSR_irq
         let saved_cpsr = self.cpsr;
         if std::env::var("IRQ_TRACE").is_ok() {
-            eprintln!("[IRQ] enter cpsr=0x{:08X} mode={:?} thumb={} ret=0x{:08X}",
-                saved_cpsr.bits, saved_cpsr.mode(), saved_cpsr.thumb(), return_addr);
+            eprintln!("[IRQ] enter cpsr=0x{:08X} mode={:?} thumb={} ret=0x{:08X} ie=0x{:04X} ir=0x{:04X} ime={}",
+                saved_cpsr.bits, saved_cpsr.mode(), saved_cpsr.thumb(), return_addr,
+                bus.interrupt.ie, bus.interrupt.ir, bus.interrupt.ime);
         }
         self.switch_mode(CpuMode::Irq);
         self.set_spsr(saved_cpsr);

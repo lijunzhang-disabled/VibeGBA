@@ -31,6 +31,21 @@ impl BackupMedia {
         }
     }
 
+    /// True when backup hardware is mid-command-sequence (not idle).
+    pub fn is_busy(&self) -> bool {
+        match self {
+            BackupMedia::Flash(f) => f.is_busy(),
+            _ => false,
+        }
+    }
+
+    /// Tick the backup chip's internal timers.
+    pub fn tick(&mut self, cycles: u32) {
+        if let BackupMedia::Flash(f) = self {
+            f.tick(cycles);
+        }
+    }
+
     /// Export raw save data for .sav file.
     pub fn to_raw(&self) -> Option<Vec<u8>> {
         match self {

@@ -366,6 +366,18 @@ impl Bus {
     pub fn iwram_mut(&mut self) -> &mut [u8] { &mut self.iwram }
     pub fn ewram_ref(&self) -> &[u8] { &self.ewram }
 
+    /// True when the backup chip is mid-command-sequence. Used by the
+    /// EXPERIMENT_GATE in cpu::step() to test the "IRQs during flash"
+    /// hypothesis.
+    pub fn backup_busy(&self) -> bool {
+        self.backup.is_busy()
+    }
+
+    /// Tick backup chip's sticky-busy timer.
+    pub fn tick_backup(&mut self, cycles: u32) {
+        self.backup.tick(cycles);
+    }
+
     // ─── DMA execution ─────────────────────────────────────────────
 
     /// Execute a DMA transfer for the given channel.
