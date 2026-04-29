@@ -123,6 +123,38 @@ preceding instruction or literal pool word. The bytes at that address
 decode as some unrelated opcode, often a load + `BX Rn` chain that
 walks off into garbage.
 
+#### Worked example (THUMB)
+
+What `handle_interrupt()` actually does with R15:
+
+```rust
+let return_addr = if thumb { regs[15] } else { regs[15] - 4 };
+// ... save SPSR, switch to IRQ mode ...
+regs[14] = return_addr;        // ← LR_irq = return_addr
+regs[15] = 0x18;               // R15 always set to IRQ vector
+pipeline_flushed = true;
+```
+
+`R15` is always set to `0x18` (the IRQ vector) on entry. The thing
+that depends on the current `regs[15]` value is `LR_irq` — the return
+address stashed into the IRQ-banked R14 and used later by
+`SUBS PC, LR, #4` to come back.
+
+**Normal case** — invariant holds, `regs[15] = next + 4` (THUMB):
+- `return_addr = regs[15] = next + 4`
+- `LR_irq = next + 4`
+- IRQ handler runs, `SUBS PC, LR, #4` → `PC = LR_irq − 4 = next`. ✓
+
+**Bug case** — just after a branch, no refill yet,
+`regs[15] = target` (THUMB):
+- `return_addr = regs[15] = target`
+- `LR_irq = target`
+- IRQ handler runs, `SUBS PC, LR, #4` → `PC = LR_irq − 4 = target − 4`. ✗
+
+We resume 4 bytes before the branch target — inside whatever
+instruction lived there in memory. ARM mode is the same idea but off
+by 8 instead of 4.
+
 ### 5. Why this looked like flaky timing
 
 The vulnerable window is exactly one CPU step after each branch. With
