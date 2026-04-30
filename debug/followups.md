@@ -35,54 +35,21 @@ not sufficient — both fixes are needed for round-trip saves to work.
 
 ## High priority — known correctness bugs
 
-### 0. Super Robot Taisen: Original Generation — boots but stays black
-Status: open (deep). Session 2026-04-30 ruled out the obvious culprits.
+### 0. Super Robot Taisen: Original Generation — fixed (chip ID) ✅
+Status: resolved 2026-04-30. See
+`debug/2026-04-30_srtog-flash-chip-id.md` for the full investigation.
 
-Confirmed working:
-- CPU runs (irqs counter increments at exactly vblank rate, 60/sec)
-- Pipeline / IRQ entry / IRQ exit (commits b29226f + 27722c4)
-- No unimplemented SWIs (only 0x0B CpuSet at boot, then 0x05
-  VBlankIntrWait every frame)
-- DISPSTAT bit 3 set, IE=0x2001, IME on, user IRQ handler installed
-  at 0x03006CC0, handler ACKs IF correctly
-- Vblank handler at 0x08000800 runs every frame, writes DISPCNT from
-  shadow at `[R4 + 0x60] = 0x020234D0`
+Root cause: our hardcoded 64 KB Flash chip-ID was Atmel
+(0x1F, 0x3D), not in SRTOG's supported-chip table. The game's boot
+init treated this as "unrecognised save hardware" and parked the
+state machine on its 0xFFFF sentinel, so no display state was ever
+programmed.
 
-The actual stall:
-- Game maintains a state struct at 0x02001940. State ID at offset +2
-  is initialized to 0xFFFF (sentinel) by code at 0x080002FC. Prev
-  (+4) and next (+6) also explicitly set to 0xFFFF.
-- Main loop dispatches on state_id. State 0xFFFF goes through chain
-  of BGT comparisons to default handler at 0x0800045C, which checks
-  `[+6] = next` for transition target. If next is -1, no transition.
-- DISPCNT shadow at 0x020234D0 stays 0 (never written), so vblank
-  handler keeps writing DISPCNT=0.
-
-What we don't know: where the state advance is supposed to come
-from. Nothing in the main loop, vblank handler, or IRQ subhandlers
-we've traced writes to 0x02001942 / 0x02001946 / 0x020234D0 after
-init. Needs more reverse engineering.
-
-Reproduction:
-```
-DUMP_PC=1 ./target/release/gba-frontend ~/Documents/SuperRobotTaisen-OriginalGeneration.gba
-```
-shows `dispcnt=0x0000` and `state_id=0xFFFF` (via MEM_WATCH peek)
-indefinitely.
-
-Useful diagnostics (env-gated, all in tree):
-- `SWI_TRACE=1`, `DISPCNT_TRACE=1`, `MEM_WATCH=1` with
-  `MEM_WATCH_LO/HI`
-- `DUMP_PC=1` dumps the user IRQ handler bytes once at start
-
-Possible next angles:
-- Dump 0x08001384 onward (BL inside vblank handler) to see if it has
-  a state-machine tick
-- Search ROM for STRH instructions that target `0x02001946` or
-  `0x020234D0` to find who is supposed to write them
-- Check whether Pokémon's working IRQ flow happens to update the
-  BIOS flag mirror at `0x03007FF8` (which in our trace stays 0) and
-  SRTOG's flow needs that to detect vblank-completed
+Fix: `pick_chip_id()` now scans the ROM for any of the known chip-ID
+halfwords (Panasonic / SST / Macronix / Sanyo / Atmel) and returns
+whichever appears in the ROM's table. Falls back to Panasonic for
+64 KB / Macronix MX29L1100B for 128 KB. Both Pokémon and SRTOG now
+boot correctly.
 
 ### 1. Pokémon Emerald: residual minor audio noise
 Status: open  

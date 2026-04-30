@@ -176,6 +176,12 @@ impl Cpu {
 
     /// Execute one instruction. Returns the number of cycles consumed.
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
+        // Snapshot PC for debug tracers (MEM_WATCH etc). Cheap.
+        bus.last_pc = if self.cpsr.thumb() {
+            self.regs[15].wrapping_sub(4)
+        } else {
+            self.regs[15].wrapping_sub(8)
+        };
         // Refill the pipeline BEFORE checking for IRQs. After a branch
         // (or any instruction that wrote PC), pipeline_flushed is true and
         // regs[15] holds the raw branch target — not the +4/+8 pipeline-

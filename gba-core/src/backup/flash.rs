@@ -61,16 +61,29 @@ pub struct Flash {
     /// the entire save loop, not just the brief command-sequence window.
     #[serde(default, skip)]
     busy_cycles: u32,
+    /// Chip ID we report to the game (manufacturer, device).
+    /// Selected at construction time so that the value appears in the
+    /// game's own list of supported chips — see `pick_chip_id`.
+    #[serde(default)]
+    reported_id: (u8, u8),
 }
 
 impl Flash {
     pub fn new(size: usize) -> Self {
+        Self::new_with_rom(size, None)
+    }
+
+    /// Construct a Flash chip with the given size, optionally scanning the
+    /// ROM to pick a chip ID the game will accept.
+    pub fn new_with_rom(size: usize, rom: Option<&[u8]>) -> Self {
+        let reported_id = pick_chip_id(size, rom);
         Flash {
             data: vec![0xFF; size],
             state: FlashState::Ready,
             bank: 0,
             size,
             busy_cycles: 0,
+            reported_id,
         }
     }
 
@@ -90,17 +103,11 @@ impl Flash {
         self.busy_cycles = self.busy_cycles.saturating_sub(cycles);
     }
 
-    /// Manufacturer + Device ID for chip identification.
-    /// Use Macronix (most common in real cartridges, esp. Pokémon Emerald)
-    /// rather than Sanyo — Pokémon's per-chip save routines have a Sanyo
-    /// status-polling path that we don't emulate, causing in-game saves to
-    /// hang. See debug bug record for the investigation.
+    /// Manufacturer + Device ID we report to the game when it queries
+    /// the chip in identification mode. Selected at construction time
+    /// based on the ROM's chip-ID table (see `pick_chip_id`).
     fn chip_id(&self) -> (u8, u8) {
-        if self.is_128k() {
-            (0xC2, 0x09) // Macronix MX29L1100B (1 Mbit / 128 KB)
-        } else {
-            (0x1F, 0x3D) // Atmel AT29LV512 (64 KB)
-        }
+        self.reported_id
     }
 
     fn bank_offset(&self) -> usize {
@@ -227,6 +234,64 @@ impl Flash {
     }
 }
 
+/// Each GBA flash cartridge has a 16-bit chip ID (manufacturer | device
+/// in little-endian halfword order). When a save-capable game boots, it
+/// puts the chip into ID mode (write 0xAA / 0x55 / 0x90), reads the ID,
+/// and looks it up in a built-in table of supported chips. If the ID
+/// isn't in the table the game treats save hardware as broken and
+/// often refuses to advance past early init.
+///
+/// We only have one chip in the box, so we pick a chip ID up front:
+/// scan the ROM for any of the well-known IDs of the right size class
+/// and use the first one we find. If nothing matches we fall back to
+/// the most commonly-supported chip in each size class (Panasonic for
+/// 64 KB, Macronix MX29L1100B for 128 KB).
+///
+/// Returned as (manufacturer, device).
+fn pick_chip_id(size: usize, rom: Option<&[u8]>) -> (u8, u8) {
+    // Candidate chip IDs in preference order, (manufacturer, device).
+    // Both halves combined as little-endian halfword = mfr | (dev<<8).
+    let candidates_64k: &[(u8, u8, &str)] = &[
+        (0x32, 0x1B, "Panasonic MN63F805MNP"),
+        (0xBF, 0xD4, "SST 39VF512"),
+        (0xC2, 0x1C, "Macronix MX29L512"),
+        (0x62, 0x13, "Sanyo LE26FV10N1TS"),
+        (0x1F, 0x3D, "Atmel AT29LV512"),
+    ];
+    let candidates_128k: &[(u8, u8, &str)] = &[
+        (0xC2, 0x09, "Macronix MX29L1100B"),
+        (0xC2, 0x1C, "Macronix MX29L010"),
+        (0x62, 0x13, "Sanyo LE26FV10N1TS"),
+    ];
+    let candidates: &[(u8, u8, &str)] = if size > 64 * 1024 {
+        candidates_128k
+    } else {
+        candidates_64k
+    };
+
+    if let Some(rom) = rom {
+        // Halfword-aligned scan for any candidate ID that appears in the
+        // ROM. The chip-ID table stores each supported chip's ID as a
+        // halfword (LDRH at +0x28 in the dispatch we saw), so a hit means
+        // the ROM's table includes that chip.
+        for &(mfr, dev, _name) in candidates {
+            let id_le = (mfr as u16) | ((dev as u16) << 8);
+            let lo = id_le as u8;
+            let hi = (id_le >> 8) as u8;
+            // Walk halfword-aligned offsets. Bail out early on first hit.
+            for i in (0..rom.len().saturating_sub(2)).step_by(2) {
+                if rom[i] == lo && rom[i + 1] == hi {
+                    return (mfr, dev);
+                }
+            }
+        }
+    }
+
+    // Default: first candidate. Panasonic for 64 KB, Macronix for 128 KB.
+    let (mfr, dev, _) = candidates[0];
+    (mfr, dev)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,8 +304,8 @@ mod tests {
         flash.write(0x2AAA, 0x55);
         flash.write(0x5555, 0x90);
 
-        assert_eq!(flash.read(0), 0x1F); // Atmel manufacturer
-        assert_eq!(flash.read(1), 0x3D); // Atmel device
+        assert_eq!(flash.read(0), 0x32); // Panasonic manufacturer
+        assert_eq!(flash.read(1), 0x1B); // Panasonic MN63F805MNP device
 
         // Exit chip ID
         flash.write(0x5555, 0xAA);

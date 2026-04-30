@@ -64,9 +64,9 @@ pub fn detect_backup_type(rom: &[u8]) -> BackupMedia {
     if rom_str.contains("SRAM_V") {
         BackupMedia::Sram(sram::Sram::new())
     } else if rom_str.contains("FLASH1M_V") {
-        BackupMedia::Flash(flash::Flash::new(128 * 1024))
+        BackupMedia::Flash(flash::Flash::new_with_rom(128 * 1024, Some(rom)))
     } else if rom_str.contains("FLASH_V") || rom_str.contains("FLASH512_V") {
-        BackupMedia::Flash(flash::Flash::new(64 * 1024))
+        BackupMedia::Flash(flash::Flash::new_with_rom(64 * 1024, Some(rom)))
     } else if rom_str.contains("EEPROM_V") {
         BackupMedia::Eeprom(eeprom::Eeprom::new())
     } else {

@@ -53,6 +53,10 @@ pub struct Bus {
     pub has_bios: bool,
     /// Set when HALTCNT is written — CPU should halt
     pub halt_requested: bool,
+    /// Last PC the CPU was executing — set by CPU at top of step().
+    /// Used by MEM_WATCH and similar diagnostics. Not authoritative for
+    /// emulation correctness; debug-only.
+    pub last_pc: u32,
 }
 
 impl Bus {
@@ -84,6 +88,7 @@ impl Bus {
             bios_latch: 0,
             has_bios,
             halt_requested: false,
+            last_pc: 0,
         }
     }
 
@@ -224,8 +229,6 @@ impl Bus {
 
     pub fn write8(&mut self, addr: u32, val: u8) {
         if std::env::var("MEM_WATCH").is_ok() {
-            // Watch a small EWRAM range; print every store that hits it.
-            // Set MEM_WATCH=1 plus optional MEM_WATCH_LO/HI hex addrs to widen.
             let lo = std::env::var("MEM_WATCH_LO")
                 .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(0x0200_1940);
@@ -233,7 +236,7 @@ impl Bus {
                 .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(0x0200_194A);
             if addr >= lo && addr < hi {
-                eprintln!("[WR8 ] 0x{:08X} = 0x{:02X}", addr, val);
+                eprintln!("[WR8 ] 0x{:08X} = 0x{:02X}  pc=0x{:08X}", addr, val, self.last_pc);
             }
         }
         match addr >> 24 {
@@ -297,7 +300,7 @@ impl Bus {
                 .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(0x0200_194A);
             if addr >= lo && addr < hi {
-                eprintln!("[WR16] 0x{:08X} = 0x{:04X}", addr, val);
+                eprintln!("[WR16] 0x{:08X} = 0x{:04X}  pc=0x{:08X}", addr, val, self.last_pc);
             }
         }
         let addr = addr & !1;
@@ -358,7 +361,7 @@ impl Bus {
                 .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(0x0200_194A);
             if addr >= lo && addr < hi {
-                eprintln!("[WR32] 0x{:08X} = 0x{:08X}", addr, val);
+                eprintln!("[WR32] 0x{:08X} = 0x{:08X}  pc=0x{:08X}", addr, val, self.last_pc);
             }
         }
         let addr = addr & !3;
