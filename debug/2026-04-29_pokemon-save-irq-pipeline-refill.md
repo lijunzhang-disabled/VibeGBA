@@ -167,7 +167,52 @@ Save state (`]`/`[`) snapshots don't exhibit this because they're a
 single deterministic memory copy — no IRQ delivery during the snapshot
 path.
 
-### 6. The fix
+### 6. Why only the save flow exposed it
+
+The bug-firing *rate* was constant the whole time the game was
+running. Branches happen every 5–20 cycles regardless of what code is
+executing, and vblank IRQs fire 60 times a second regardless. So the
+collision probability per second was the same in cutscenes, menus,
+overworld walking, and the save loop alike.
+
+What differed was the *consequence* per fire:
+
+| Where the wrong-PC lands     | Outcome                                                                                                       |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Inside a literal pool word   | Decodes as some random opcode, often loads garbage into a register; CPU recovers within a few instructions    |
+| Inside a real instruction    | Decodes as a different valid instruction, may corrupt one register that's about to be overwritten anyway     |
+| At a `BX Rn` with stale `Rn` | CPU jumps off into unmapped memory — full crash                                                              |
+
+During regular gameplay, the first two outcomes are the *common* case
+and are invisible to the player: one frame of wrong rendering, a
+glitched audio sample, an ignored input — all blend into normal game
+noise. The CPU usually executes a return or a known branch within a
+handful of cycles and is back on the rails.
+
+During the save flow, every wrong instruction is fatal:
+
+1. Pokémon's save writes ~57k bytes across 14 sectors, each with a
+   sum-fold checksum stored in the sector's tail. A single wrong
+   register value during checksum computation makes that sector's
+   stored checksum disagree with its data, and on the next boot
+   Pokémon refuses the save as corrupt.
+2. The save loop runs for ~1.5–2 seconds of CPU time, during which
+   dozens of vblank IRQs fire. At ~60% per-save collision probability,
+   the bug landed somewhere damaging more often than not.
+3. The Flash chip's command-sequence state machine is also unforgiving:
+   if a wrong instruction interleaves into the
+   `0xAA → 0x55 → 0xA0 → data` sequence, the chip drops back to Ready
+   and the byte never gets stored at all.
+
+Worth noting in retrospect: the earlier "game soft-resets to the title
+screen during normal play before save was even attempted" reports were
+almost certainly this same bug firing in gameplay code, landing in
+something that triggered Pokémon's fatal-error handler. We treated
+those as a separate flake at the time. With this fix, that whole class
+of intermittent crash should be gone too — not just the save
+corruption.
+
+### 7. The fix
 
 Move the refill **above** the IRQ check so `regs[15]` is always at the
 correct pipeline-ahead value before `handle_interrupt()` reads it:
