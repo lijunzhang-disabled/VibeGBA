@@ -223,6 +223,19 @@ impl Bus {
     // ─── 8-bit writes ─────────────────────────────────────────────
 
     pub fn write8(&mut self, addr: u32, val: u8) {
+        if std::env::var("MEM_WATCH").is_ok() {
+            // Watch a small EWRAM range; print every store that hits it.
+            // Set MEM_WATCH=1 plus optional MEM_WATCH_LO/HI hex addrs to widen.
+            let lo = std::env::var("MEM_WATCH_LO")
+                .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0x0200_1940);
+            let hi = std::env::var("MEM_WATCH_HI")
+                .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0x0200_194A);
+            if addr >= lo && addr < hi {
+                eprintln!("[WR8 ] 0x{:08X} = 0x{:02X}", addr, val);
+            }
+        }
         match addr >> 24 {
             0x02 => self.ewram[(addr & 0x3FFFF) as usize] = val,
             0x03 => self.iwram[(addr & 0x7FFF) as usize] = val,
@@ -276,6 +289,17 @@ impl Bus {
     // ─── 16-bit writes ────────────────────────────────────────────
 
     pub fn write16(&mut self, addr: u32, val: u16) {
+        if std::env::var("MEM_WATCH").is_ok() {
+            let lo = std::env::var("MEM_WATCH_LO")
+                .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0x0200_1940);
+            let hi = std::env::var("MEM_WATCH_HI")
+                .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0x0200_194A);
+            if addr >= lo && addr < hi {
+                eprintln!("[WR16] 0x{:08X} = 0x{:04X}", addr, val);
+            }
+        }
         let addr = addr & !1;
         let bytes = val.to_le_bytes();
         match addr >> 24 {
@@ -326,6 +350,17 @@ impl Bus {
     // ─── 32-bit writes ────────────────────────────────────────────
 
     pub fn write32(&mut self, addr: u32, val: u32) {
+        if std::env::var("MEM_WATCH").is_ok() {
+            let lo = std::env::var("MEM_WATCH_LO")
+                .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0x0200_1940);
+            let hi = std::env::var("MEM_WATCH_HI")
+                .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0x0200_194A);
+            if addr >= lo && addr < hi {
+                eprintln!("[WR32] 0x{:08X} = 0x{:08X}", addr, val);
+            }
+        }
         let addr = addr & !3;
         let bytes = val.to_le_bytes();
         match addr >> 24 {

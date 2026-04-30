@@ -321,6 +321,23 @@ fn main() {
                         gba.cpu.regs[4], gba.cpu.regs[5], gba.cpu.regs[6], gba.cpu.regs[7],
                         gba.cpu.regs[13], gba.cpu.regs[14],
                     );
+                    // One-time dump of the user IRQ handler at [0x03007FFC].
+                    // Useful when triaging a "boots but stays black" game —
+                    // tells you whether the handler was installed and what
+                    // it does on entry.
+                    static DUMPED_IRQ: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !DUMPED_IRQ.swap(true, std::sync::atomic::Ordering::Relaxed)
+                        && irq_handler_ptr != 0
+                    {
+                        let base = irq_handler_ptr & !1;
+                        eprint!("[IRQ_CODE] @0x{:08X}:", base);
+                        for i in 0..16 {
+                            let w = gba.bus.read32(base + i * 4);
+                            eprint!(" {:08X}", w);
+                        }
+                        eprintln!();
+                    }
                 }
             }
         }

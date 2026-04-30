@@ -30,6 +30,12 @@ use crate::bus::Bus;
 
 /// Handle a BIOS SWI call via HLE. Returns true if handled.
 pub fn handle_swi(cpu: &mut Cpu, bus: &mut Bus, comment: u8) -> bool {
+    if std::env::var("SWI_TRACE").is_ok() {
+        eprintln!(
+            "[SWI] 0x{:02X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X}",
+            comment, cpu.regs[0], cpu.regs[1], cpu.regs[2], cpu.regs[3]
+        );
+    }
     match comment {
         0x00 => swi_soft_reset(cpu, bus),
         0x01 => swi_register_ram_reset(cpu, bus),
