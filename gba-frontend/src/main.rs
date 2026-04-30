@@ -301,18 +301,24 @@ fn main() {
                 }
                 let want_dump = frame_count % 30 == 0 || (!pc_in_valid && frame_count % 5 == 0);
                 if want_dump {
+                    let dispstat = gba.bus.io.dispstat;
+                    let dispcnt = gba.bus.io.dispcnt;
+                    let irq_handler_ptr = gba.bus.read32(0x0300_7FFC);
                     eprintln!(
-                        "[PC] f={} pc=0x{:08X} {} mode={:?} irq_dis={} halt={} valid={} ie=0x{:04X} ir=0x{:04X} ime={} | r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} sp=0x{:08X} lr=0x{:08X}",
+                        "[PC] f={} pc=0x{:08X} {} mode={:?} halt={} dispcnt=0x{:04X} dispstat=0x{:04X} ie=0x{:04X} ir=0x{:04X} usr_irq=0x{:08X} irqs={} vbl={} | r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} sp=0x{:08X} lr=0x{:08X}",
                         frame_count, pc,
                         if thumb {"T"} else {"A"},
                         gba.cpu.cpsr.mode(),
-                        gba.cpu.cpsr.irq_disabled(),
                         gba.cpu.halted,
-                        pc_in_valid,
+                        dispcnt,
+                        dispstat,
                         gba.bus.interrupt.ie,
                         gba.bus.interrupt.ir,
-                        gba.bus.interrupt.ime,
+                        irq_handler_ptr,
+                        gba.cpu.irq_entries,
+                        gba.vblank_irqs_raised,
                         gba.cpu.regs[0], gba.cpu.regs[1], gba.cpu.regs[2], gba.cpu.regs[3],
+                        gba.cpu.regs[4], gba.cpu.regs[5], gba.cpu.regs[6], gba.cpu.regs[7],
                         gba.cpu.regs[13], gba.cpu.regs[14],
                     );
                 }

@@ -201,6 +201,19 @@ impl Gba {
             while let Some(event) = self.scheduler.pop_if_ready() {
                 self.handle_event(event);
             }
+
+            // Wake a halted CPU when any enabled IRQ becomes pending.
+            // Real ARM7TDMI: halt-wake is gated only by (IE & IF) != 0;
+            // IME and CPSR.I gate IRQ *delivery* but not halt *exit*.
+            // Without this, games that use SWI IntrWait / VBlankIntrWait
+            // freeze on the first halt — step() is the only place that
+            // clears `halted`, but the inner loop above skips step() while
+            // halted (it fast-forwards the scheduler instead).
+            if self.cpu.halted
+                && (self.bus.interrupt.ie & self.bus.interrupt.ir) != 0
+            {
+                self.cpu.halted = false;
+            }
         }
     }
 

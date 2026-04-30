@@ -634,7 +634,12 @@ impl Bus {
 
     fn write_io16(&mut self, addr: u32, val: u16) {
         match addr & 0x3FF {
-            0x000 => self.io.dispcnt = val,
+            0x000 => {
+                if std::env::var("DISPCNT_TRACE").is_ok() && self.io.dispcnt != val {
+                    eprintln!("[DISPCNT] 0x{:04X} → 0x{:04X}", self.io.dispcnt, val);
+                }
+                self.io.dispcnt = val;
+            }
             0x002 => self.io.green_swap = val,
             0x004 => {
                 // DISPSTAT: bits 0-2 are read-only (VBlank, HBlank, VCount match)
