@@ -35,6 +35,27 @@ not sufficient — both fixes are needed for round-trip saves to work.
 
 ## High priority — known correctness bugs
 
+### 0. Super Robot Taisen: Original Generation — boots but stays black
+Status: open  
+First non-Pokémon commercial game we tried. After commits b29226f (IRQ
+pipeline-refill) + 27722c4 (halt-wake), the CPU runs steadily — IRQs
+delivered every vblank, main game loop iterates once per frame, R4
+(state struct ptr) stable, no PC escape — but the game never writes
+DISPCNT, so the screen stays black. No unhandled-SWI warnings; input
+doesn't change anything.
+
+Next steps to try:
+- Implement SWI 0x19 SoundBias and 0x1A–0x1C sound-driver SWIs (item
+  #8 below). Banpresto SRPGs from this era often poll a flag the BIOS
+  sound driver sets.
+- Trace what `[0x02019B6E]` and the byte at `[R4+8]` (the comparison
+  in the main loop body at 0x08000334) eventually compare against —
+  that's the state machine gate.
+- Consider whether the game expects the BIOS to OR `IF` bits into the
+  flag mirror at `0x03007FF8` on IRQ entry. Our HLE stub doesn't do
+  that; the user IRQ handler usually does, but worth verifying for
+  this title.
+
 ### 1. Pokémon Emerald: residual minor audio noise
 Status: open  
 The DMA re-anchor fix (2026-04-25) made Pokémon play actual music, but
