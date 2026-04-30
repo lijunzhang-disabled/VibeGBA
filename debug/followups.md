@@ -35,35 +35,51 @@ not sufficient — both fixes are needed for round-trip saves to work.
 
 ## High priority — known correctness bugs
 
-### 0. Super Robot Taisen: Original Generation — fixed (chip ID) ✅
-Status: resolved 2026-04-30. See
-`debug/2026-04-30_srtog-flash-chip-id.md` for the full investigation.
+### 0. Super Robot Taisen: Original Generation — visuals fixed; audio buzzy
+Status: visual path resolved 2026-04-30 (chip ID). Audio sounds buzzy
+("zizizi") with a slow amplitude wobble — same class of issue as
+Pokémon's residual noise (item #1 below).
 
-Root cause: our hardcoded 64 KB Flash chip-ID was Atmel
-(0x1F, 0x3D), not in SRTOG's supported-chip table. The game's boot
-init treated this as "unrecognised save hardware" and parked the
-state machine on its 0xFFFF sentinel, so no display state was ever
-programmed.
+What's working: game boots past chip-ID gate, title screen renders
+(`dispcnt=0x0300`), state machine progresses through 0x32 → 0x3C →
+0x46 → 0x64 → … (verified via MEM_WATCH). State transitions queue
+correctly and complete.
 
-Fix: `pick_chip_id()` now scans the ROM for any of the known chip-ID
-halfwords (Panasonic / SST / Macronix / Sanyo / Atmel) and returns
-whichever appears in the ROM's table. Falls back to Panasonic for
-64 KB / Macronix MX29L1100B for 128 KB. Both Pokémon and SRTOG now
-boot correctly.
+Visual fix: see `debug/2026-04-30_srtog-flash-chip-id.md`. Our
+hardcoded 64 KB Atmel chip ID wasn't in SRTOG's supported-chip
+table, so the game treated save hardware as broken and parked the
+state machine on its 0xFFFF sentinel. `pick_chip_id()` now scans the
+ROM for any known chip-ID and returns the first match (Panasonic >
+SST > Macronix > Sanyo > Atmel for 64 KB; Macronix variants > Sanyo
+for 128 KB). Pokémon (128 KB) and SRTOG (64 KB) both boot correctly.
 
-### 1. Pokémon Emerald: residual minor audio noise
-Status: open  
-The DMA re-anchor fix (2026-04-25) made Pokémon play actual music, but
-the user reports "very minor background noise" still present. Likely
-candidates:
-- Mixer amplitude scaling (we multiply averaged samples by 120 — could be
-  miscalibrated).
-- Oversampling box-car artifact (boxcar averaging 349-sample windows
-  introduces some aliasing).
-- DC offset / SOUNDBIAS handling.
+Audio: see item #1.
 
-Probably small, but want to chase with a reference recording from mGBA or
-a real cartridge for direct comparison.
+### 1. Audio mixer: residual buzz across multiple games
+Status: open. Confirmed on Pokémon Emerald (subtle background noise)
+and Super Robot Taisen: OG (more pronounced "zizizi" with amplitude
+wobble). Both games use M4A engine directly — not BIOS sound driver.
+
+Suspected causes (in rough order of likelihood):
+1. **Mixer clipping.** `apu/mod.rs::emit_sample` scales averaged
+   samples by 120×, then clamps to ±32767. Theoretical peak signal
+   (4×PSG_max + 2×FIFO_max) × 120 ≈ ±37 920 — clamps every loud
+   peak, and clipped square-wave edges produce a "zizizi" buzz.
+   Fix candidate: reduce scale to ~60-80×, or apply a true soft
+   clip rather than hard clamp.
+2. **PSG output range doubled.** `psg.rs` outputs ±envelope_volume
+   for high/low duty (range −15..+15), but real hardware outputs
+   0..15 unsigned (range −7..+8 after DC removal). Our PSG is
+   roughly 2× too loud, contributing to the clipping above.
+3. **SOUNDCNT_H DSA/DSB volume bits.** Need to verify we apply the
+   50% / 100% direct-sound volume scaling correctly.
+4. **Boxcar averaging artifact.** 349-sample boxcar at 48 kHz output;
+   linear-phase but with poor stop-band attenuation. Could replace
+   with a multi-tap FIR or a 2-3 stage IIR.
+
+Right way to chase: capture a reference recording from mGBA on the
+same ROMs at known frames, A/B against ours, and tune the mixer
+scale + PSG range together until peaks line up without clipping.
 
 ### 2. 8-bit Flash region: 16-bit / 32-bit writes
 Status: known-incomplete  
