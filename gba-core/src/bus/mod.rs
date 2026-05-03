@@ -10,6 +10,28 @@ use crate::rtc::Rtc;
 use crate::timer::Timers;
 use io_regs::IoRegisters;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+
+/// Cached MEM_WATCH state — env::var is too expensive to call on every
+/// memory write. Returns (enabled, lo, hi). When disabled, lo == hi.
+fn mem_watch_range() -> (bool, u32, u32) {
+    static V: OnceLock<(bool, u32, u32)> = OnceLock::new();
+    *V.get_or_init(|| {
+        let enabled = std::env::var("MEM_WATCH").is_ok();
+        let lo = std::env::var("MEM_WATCH_LO")
+            .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x0200_1940);
+        let hi = std::env::var("MEM_WATCH_HI")
+            .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x0200_194A);
+        (enabled, lo, hi)
+    })
+}
+
+fn dispcnt_trace_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DISPCNT_TRACE").is_ok())
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Bus {
@@ -228,16 +250,9 @@ impl Bus {
     // ─── 8-bit writes ─────────────────────────────────────────────
 
     pub fn write8(&mut self, addr: u32, val: u8) {
-        if std::env::var("MEM_WATCH").is_ok() {
-            let lo = std::env::var("MEM_WATCH_LO")
-                .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                .unwrap_or(0x0200_1940);
-            let hi = std::env::var("MEM_WATCH_HI")
-                .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                .unwrap_or(0x0200_194A);
-            if addr >= lo && addr < hi {
-                eprintln!("[WR8 ] 0x{:08X} = 0x{:02X}  pc=0x{:08X}", addr, val, self.last_pc);
-            }
+        let (mw, lo, hi) = mem_watch_range();
+        if mw && addr >= lo && addr < hi {
+            eprintln!("[WR8 ] 0x{:08X} = 0x{:02X}  pc=0x{:08X}", addr, val, self.last_pc);
         }
         match addr >> 24 {
             0x02 => self.ewram[(addr & 0x3FFFF) as usize] = val,
@@ -292,16 +307,9 @@ impl Bus {
     // ─── 16-bit writes ────────────────────────────────────────────
 
     pub fn write16(&mut self, addr: u32, val: u16) {
-        if std::env::var("MEM_WATCH").is_ok() {
-            let lo = std::env::var("MEM_WATCH_LO")
-                .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                .unwrap_or(0x0200_1940);
-            let hi = std::env::var("MEM_WATCH_HI")
-                .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                .unwrap_or(0x0200_194A);
-            if addr >= lo && addr < hi {
-                eprintln!("[WR16] 0x{:08X} = 0x{:04X}  pc=0x{:08X}", addr, val, self.last_pc);
-            }
+        let (mw, lo, hi) = mem_watch_range();
+        if mw && addr >= lo && addr < hi {
+            eprintln!("[WR16] 0x{:08X} = 0x{:04X}  pc=0x{:08X}", addr, val, self.last_pc);
         }
         let addr = addr & !1;
         let bytes = val.to_le_bytes();
@@ -353,16 +361,9 @@ impl Bus {
     // ─── 32-bit writes ────────────────────────────────────────────
 
     pub fn write32(&mut self, addr: u32, val: u32) {
-        if std::env::var("MEM_WATCH").is_ok() {
-            let lo = std::env::var("MEM_WATCH_LO")
-                .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                .unwrap_or(0x0200_1940);
-            let hi = std::env::var("MEM_WATCH_HI")
-                .ok().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                .unwrap_or(0x0200_194A);
-            if addr >= lo && addr < hi {
-                eprintln!("[WR32] 0x{:08X} = 0x{:08X}  pc=0x{:08X}", addr, val, self.last_pc);
-            }
+        let (mw, lo, hi) = mem_watch_range();
+        if mw && addr >= lo && addr < hi {
+            eprintln!("[WR32] 0x{:08X} = 0x{:08X}  pc=0x{:08X}", addr, val, self.last_pc);
         }
         let addr = addr & !3;
         let bytes = val.to_le_bytes();
@@ -673,7 +674,7 @@ impl Bus {
     fn write_io16(&mut self, addr: u32, val: u16) {
         match addr & 0x3FF {
             0x000 => {
-                if std::env::var("DISPCNT_TRACE").is_ok() && self.io.dispcnt != val {
+                if dispcnt_trace_enabled() && self.io.dispcnt != val {
                     eprintln!("[DISPCNT] 0x{:04X} → 0x{:04X}", self.io.dispcnt, val);
                 }
                 self.io.dispcnt = val;

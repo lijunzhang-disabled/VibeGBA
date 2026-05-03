@@ -5,6 +5,25 @@ pub mod disasm;
 
 use crate::bus::Bus;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+
+/// Cached lookup of debug env vars. `std::env::var` is too expensive to
+/// call once per CPU step (~16M times/sec); cache the result at first
+/// access so hot paths just read a bool from a OnceLock.
+fn experiment_gate_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("EXPERIMENT_GATE").is_ok())
+}
+
+fn instr_trace_ring_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("INSTR_TRACE_RING").is_ok())
+}
+
+fn irq_trace_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("IRQ_TRACE").is_ok())
+}
 
 /// ARM7TDMI CPU modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,7 +213,7 @@ impl Cpu {
             self.refill_pipeline(bus);
         }
 
-        let gate_irq = std::env::var("EXPERIMENT_GATE").is_ok()
+        let gate_irq = experiment_gate_enabled()
             && bus.backup_busy();
 
         // Check for pending interrupts
@@ -224,7 +243,7 @@ impl Cpu {
     }
 
     fn step_arm(&mut self, bus: &mut Bus) -> u32 {
-        if std::env::var("INSTR_TRACE_RING").is_ok() {
+        if instr_trace_ring_enabled() {
             let pc = self.regs[15].wrapping_sub(8);
             crate::push_trace_arm(pc, self.pipeline[0],
                 self.regs[0], self.regs[1], self.regs[2], self.regs[3],
@@ -258,7 +277,7 @@ impl Cpu {
 
         // Ring-buffer trace of last N THUMB instructions. When PC escapes to
         // unmapped memory, we'll dump the buffer.
-        if std::env::var("INSTR_TRACE_RING").is_ok() {
+        if instr_trace_ring_enabled() {
             let pc = self.regs[15].wrapping_sub(4);
             crate::push_trace_thumb(pc, opcode,
                 self.regs[0], self.regs[1], self.regs[2], self.regs[3],
@@ -400,7 +419,7 @@ impl Cpu {
 
         // Save CPSR to SPSR_irq
         let saved_cpsr = self.cpsr;
-        if std::env::var("IRQ_TRACE").is_ok() {
+        if irq_trace_enabled() {
             eprintln!("[IRQ] enter cpsr=0x{:08X} mode={:?} thumb={} ret=0x{:08X} ie=0x{:04X} ir=0x{:04X} ime={}",
                 saved_cpsr.bits, saved_cpsr.mode(), saved_cpsr.thumb(), return_addr,
                 bus.interrupt.ie, bus.interrupt.ir, bus.interrupt.ime);
@@ -550,7 +569,7 @@ impl Cpu {
                 // Rd=R15 with S bit: restore CPSR from SPSR, then branch
                 let spsr = self.spsr();
                 let new_mode = spsr.mode();
-                if std::env::var("IRQ_TRACE").is_ok() {
+                if irq_trace_enabled() {
                     eprintln!("[IRQ] return val=0x{:08X} spsr=0x{:08X} new_mode={:?} thumb={} from_mode={:?}",
                         val, spsr.bits, new_mode, spsr.thumb(), self.cpsr.mode());
                 }
