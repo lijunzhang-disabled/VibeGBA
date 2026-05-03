@@ -55,31 +55,36 @@ for 128 KB). Pokémon (128 KB) and SRTOG (64 KB) both boot correctly.
 
 Audio: see item #1.
 
-### 1. Audio mixer: residual buzz across multiple games
-Status: open. Confirmed on Pokémon Emerald (subtle background noise)
-and Super Robot Taisen: OG (more pronounced "zizizi" with amplitude
-wobble). Both games use M4A engine directly — not BIOS sound driver.
+### 1. Audio mixer: SRTOG buzz (Pokémon now clean)
+Status: partially resolved. Pokémon Emerald audio is correct after
+commit a14c551 (cached hot-path env-var lookups — was running at
+~10 % real-time, causing buffer-underrun "buzz" that we'd been
+chasing as a mixer issue). See
+`debug/2026-05-04_env-var-hot-path-perf.md`.
 
-Suspected causes (in rough order of likelihood):
+SRTOG still buzzes ("zizizi"). M4A-style game like Pokémon, but
+sound is more demanding and the buzz didn't go away with the perf
+fix. Remaining suspects worth chasing:
+
 1. **Mixer clipping.** `apu/mod.rs::emit_sample` scales averaged
-   samples by 120×, then clamps to ±32767. Theoretical peak signal
-   (4×PSG_max + 2×FIFO_max) × 120 ≈ ±37 920 — clamps every loud
-   peak, and clipped square-wave edges produce a "zizizi" buzz.
-   Fix candidate: reduce scale to ~60-80×, or apply a true soft
-   clip rather than hard clamp.
+   samples by 120× then clamps to ±32 767. Theoretical peak signal
+   (4 × PSG ± 15 plus 2 × FIFO ± 128) × 120 ≈ ±37 920 — clamps every
+   loud peak, and clipped square-wave edges produce buzz.
 2. **PSG output range doubled.** `psg.rs` outputs ±envelope_volume
    for high/low duty (range −15..+15), but real hardware outputs
    0..15 unsigned (range −7..+8 after DC removal). Our PSG is
    roughly 2× too loud, contributing to the clipping above.
 3. **SOUNDCNT_H DSA/DSB volume bits.** Need to verify we apply the
-   50% / 100% direct-sound volume scaling correctly.
+   50 % / 100 % direct-sound volume scaling correctly.
 4. **Boxcar averaging artifact.** 349-sample boxcar at 48 kHz output;
-   linear-phase but with poor stop-band attenuation. Could replace
-   with a multi-tap FIR or a 2-3 stage IIR.
+   linear-phase but with poor stop-band attenuation.
 
-Right way to chase: capture a reference recording from mGBA on the
-same ROMs at known frames, A/B against ours, and tune the mixer
-scale + PSG range together until peaks line up without clipping.
+We tried reducing the scale to 100×, cascading 3 IIR stages, and
+ticking timers/APU during halt periods. None of those alone fixed
+SRTOG and one of them broke Pokémon, so they were reverted. Right
+way forward is probably an A/B against an mGBA reference recording
+on the same ROM at known frames, then tune scale + PSG range
+together until peaks match without clipping.
 
 ### 2. 8-bit Flash region: 16-bit / 32-bit writes
 Status: known-incomplete  
