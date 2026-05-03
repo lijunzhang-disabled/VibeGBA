@@ -206,6 +206,16 @@ fn main() {
     let mut audio_tmp = vec![0i16; 4096];
     let mut test_buf = vec![0u16; 240 * 160];
 
+    // WAV_DUMP=path.wav captures every output sample into a 48 kHz stereo
+    // 16-bit WAV file. Used for offline spectrum analysis (Audacity, etc.)
+    // when chasing audio bugs.
+    let mut wav_dump = std::env::var("WAV_DUMP").ok().and_then(|p| {
+        match audio::WavWriter::create(&p) {
+            Ok(w) => { eprintln!("WAV_DUMP: writing samples to {}", p); Some(w) }
+            Err(e) => { eprintln!("WAV_DUMP: failed to open {}: {}", p, e); None }
+        }
+    });
+
     // PC-hot-loop sampler: when DUMP_PC=1, every 120 frames (~2s) print
     // the most-frequent PC and IRQ-disabled state from the last frame.
     // Useful for finding where the CPU is stuck during in-game save.
@@ -271,6 +281,9 @@ fn main() {
                     let n = gba.drain_audio(&mut audio_tmp);
                     if n > 0 {
                         audio_buf.push_samples(&audio_tmp[..n]);
+                        if let Some(w) = wav_dump.as_mut() {
+                            w.append(&audio_tmp[..n]);
+                        }
                     }
                 }
             }

@@ -97,6 +97,20 @@ impl Apu {
 
     /// Tick the APU by N CPU cycles. Called after each CPU step.
     pub fn tick(&mut self, cycles: u32) -> (bool, bool) {
+        // Fast path: when no PSG channels are active (the common case in
+        // M4A-engine games like Pokémon and SRTOG), the only mixed signal
+        // is the held FIFO value, which is constant for the entire batch.
+        // We can compute it once and bulk-accumulate, reducing per-cycle
+        // work from ~100 ns to amortized ~5 ns. Critical for halt-period
+        // ticking where `cycles` can be many thousands.
+        let psg_active = self.ch1.enabled
+            || self.ch2.enabled
+            || self.ch3.enabled
+            || self.ch4.enabled;
+        if !psg_active {
+            self.tick_fast(cycles);
+            return (false, false);
+        }
         for _ in 0..cycles {
             // Advance each channel by one CPU cycle so their internal timers
             // and waveform state step at the correct emulated rate.
@@ -130,6 +144,51 @@ impl Apu {
         }
         // FIFO refill is handled in on_timer_overflow()
         (false, false)
+    }
+
+    /// Bulk-tick when all PSG channels are disabled (M4A common case).
+    /// Mixed signal is the held FIFO value — constant for the whole batch.
+    /// Iterates per-emit-boundary (~349 cycles) instead of per-cycle.
+    fn tick_fast(&mut self, cycles: u32) {
+        // Compute mix once — held FIFO value, constant for the whole batch.
+        let (l, r) = if self.master_enable {
+            self.current_mix()
+        } else {
+            (0, 0)
+        };
+        let l = l as i64;
+        let r = r as i64;
+
+        let mut remaining = cycles as u64;
+        while remaining > 0 {
+            // Cycles until the next sample-emit boundary
+            let cpu_clock = CPU_CLOCK_HZ as u64;
+            let out_rate = OUTPUT_SAMPLE_RATE as u64;
+            let to_next_emit = (cpu_clock - self.sample_frac).div_ceil(out_rate);
+            let chunk = remaining.min(to_next_emit);
+
+            self.accum_left += l * chunk as i64;
+            self.accum_right += r * chunk as i64;
+            self.accum_count += chunk as u32;
+            self.sample_frac += out_rate * chunk;
+
+            if self.sample_frac >= cpu_clock {
+                self.sample_frac -= cpu_clock;
+                self.emit_sample();
+            }
+
+            remaining -= chunk;
+        }
+
+        // Frame sequencer can be batched; clock multiple times if cycles spans
+        // multiple periods. Frame seq drives PSG envelopes/sweeps, but we
+        // already know all PSGs are disabled — still update so re-enabling
+        // them later sees a correct envelope state.
+        self.frame_seq_counter += cycles;
+        while self.frame_seq_counter >= CYCLES_PER_FRAME_SEQ {
+            self.frame_seq_counter -= CYCLES_PER_FRAME_SEQ;
+            self.clock_frame_sequencer();
+        }
     }
 
     /// Compute the current mixed sample (pre-scaling). Each PSG channel is

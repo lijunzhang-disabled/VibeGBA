@@ -3,7 +3,72 @@
 //! Uses a simple ring buffer approach: the emulation loop pushes samples
 //! into a shared buffer, and the SDL2 audio callback pulls from it.
 
+use std::fs::File;
+use std::io::{Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
+
+/// Streaming WAV writer. 48 kHz stereo i16, hardcoded for our output.
+///
+/// Triggered by setting WAV_DUMP=path.wav. Useful for spectrum-analyzing
+/// audio against a reference emulator: open both files in Audacity and
+/// look at the difference.
+pub struct WavWriter {
+    file: File,
+    samples_written: u32,
+}
+
+impl WavWriter {
+    pub fn create(path: &str) -> std::io::Result<Self> {
+        let mut file = File::create(path)?;
+        // 44-byte header. We'll fix up the size fields on Drop.
+        let header = build_wav_header(0);
+        file.write_all(&header)?;
+        Ok(WavWriter { file, samples_written: 0 })
+    }
+
+    pub fn append(&mut self, samples: &[i16]) {
+        let mut bytes = Vec::with_capacity(samples.len() * 2);
+        for &s in samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let _ = self.file.write_all(&bytes);
+        self.samples_written += samples.len() as u32;
+    }
+}
+
+impl Drop for WavWriter {
+    fn drop(&mut self) {
+        // Patch RIFF chunk size and data chunk size with the actual byte count.
+        let data_bytes = self.samples_written * 2;
+        let _ = self.file.seek(SeekFrom::Start(4));
+        let _ = self.file.write_all(&(36 + data_bytes).to_le_bytes());
+        let _ = self.file.seek(SeekFrom::Start(40));
+        let _ = self.file.write_all(&data_bytes.to_le_bytes());
+    }
+}
+
+fn build_wav_header(data_bytes: u32) -> [u8; 44] {
+    let sample_rate: u32 = 48_000;
+    let channels: u16 = 2;
+    let bits_per_sample: u16 = 16;
+    let byte_rate: u32 = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
+    let block_align: u16 = channels * bits_per_sample / 8;
+    let mut h = [0u8; 44];
+    h[0..4].copy_from_slice(b"RIFF");
+    h[4..8].copy_from_slice(&(36 + data_bytes).to_le_bytes());
+    h[8..12].copy_from_slice(b"WAVE");
+    h[12..16].copy_from_slice(b"fmt ");
+    h[16..20].copy_from_slice(&16u32.to_le_bytes());        // fmt chunk size
+    h[20..22].copy_from_slice(&1u16.to_le_bytes());         // PCM
+    h[22..24].copy_from_slice(&channels.to_le_bytes());
+    h[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+    h[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+    h[32..34].copy_from_slice(&block_align.to_le_bytes());
+    h[34..36].copy_from_slice(&bits_per_sample.to_le_bytes());
+    h[36..40].copy_from_slice(b"data");
+    h[40..44].copy_from_slice(&data_bytes.to_le_bytes());
+    h
+}
 
 /// Shared audio buffer between emulation thread and SDL2 audio callback.
 /// We pre-fill with silence at startup so the SDL2 callback never underruns

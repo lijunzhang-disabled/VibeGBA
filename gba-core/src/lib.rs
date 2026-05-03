@@ -175,7 +175,28 @@ impl Gba {
             // Step CPU until next event or chunk end
             while self.scheduler.timestamp() < step_target {
                 if self.cpu.halted {
-                    self.scheduler.advance_to(step_target);
+                    // CPU halted, but APU and timers must keep ticking on
+                    // real hardware. Sub-step to each upcoming FIFO sample-
+                    // pop (timer overflow), ticking APU with the CURRENT
+                    // FIFO value over each sub-span, then popping. This
+                    // keeps audio cycle-accurate during long halts (e.g.,
+                    // SRTOG's VBlankIntrWait which halts ~99 % of frame).
+                    let now = self.scheduler.timestamp();
+                    let total_gap = (step_target - now) as u32;
+                    let mut remaining = total_gap;
+                    while remaining > 0 {
+                        let to_next = self.bus.timers.cycles_to_next_fifo_overflow();
+                        // Cap to remaining; also cap to a safety max in case
+                        // no timer is enabled (then to_next = u32::MAX).
+                        let chunk = remaining.min(to_next).max(1).min(1024);
+                        // APU sees old FIFO state for `chunk` cycles
+                        self.bus.apu.tick(chunk);
+                        // Now advance scheduler + timers (may pop FIFO once
+                        // if we hit an overflow boundary)
+                        self.scheduler.add_cycles(chunk as u64);
+                        self.tick_timers(chunk);
+                        remaining -= chunk;
+                    }
                     break;
                 }
                 let cycles = self.cpu.step(&mut self.bus) as u64;

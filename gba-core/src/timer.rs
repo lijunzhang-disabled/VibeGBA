@@ -1,4 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+
+fn timer_trace_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("TIMER_TRACE").is_ok())
+}
 
 /// Prescaler dividers: F/1, F/64, F/256, F/1024
 const PRESCALER_DIVIDERS: [u32; 4] = [1, 64, 256, 1024];
@@ -82,6 +88,18 @@ impl Timers {
         if !old_enabled && new_enabled {
             self.timers[id].counter = self.timers[id].reload;
             self.timers[id].prescaler_counter = 0;
+            if timer_trace_enabled() {
+                let reload = self.timers[id].reload as u32;
+                let prescaler = self.timers[id].prescaler();
+                // Cycles per overflow = (0x10000 - reload) * prescaler.
+                // Sample rate = CPU_CLOCK / cycles_per_overflow.
+                let cycles_per = (0x10000u32 - reload) * prescaler;
+                let rate_hz = if cycles_per > 0 { 16_777_216 / cycles_per } else { 0 };
+                eprintln!(
+                    "[TIMER] T{} start: reload=0x{:04X} prescaler={} → cycles/overflow={} → {} Hz",
+                    id, reload, prescaler, cycles_per, rate_hz
+                );
+            }
         }
     }
 
@@ -140,6 +158,26 @@ impl Timers {
         }
 
         result
+    }
+
+    /// Cycles until the next overflow of T0 or T1 (whichever is sooner).
+    /// Returns u32::MAX if neither timer is enabled.
+    /// Used by halt-period sub-stepping so we can place FIFO sample-pops
+    /// at exactly the right cycle within an idle span.
+    pub fn cycles_to_next_fifo_overflow(&self) -> u32 {
+        let mut best = u32::MAX;
+        for i in 0..2usize {
+            let t = &self.timers[i];
+            if !t.enabled() || (t.cascade() && i > 0) { continue; }
+            let prescaler = t.prescaler();
+            // Cycles until next timer increment
+            let to_next_tick = prescaler - t.prescaler_counter;
+            // Plus ticks until counter wraps to reload (i.e., 0x10000)
+            let ticks_to_overflow = (0x10000u32 - t.counter as u32).saturating_sub(1);
+            let cycles = to_next_tick + ticks_to_overflow.saturating_mul(prescaler);
+            if cycles < best { best = cycles; }
+        }
+        best
     }
 
     /// Increment a timer's counter by `ticks`. Returns the number of overflows.
