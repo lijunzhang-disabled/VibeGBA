@@ -429,6 +429,21 @@ impl Bus {
         if !ch.enabled() || !ch.active {
             return (0, false);
         }
+        self.dma.channels[channel_id].run_count += 1;
+        if std::env::var("DMA_FIRE_TRACE").is_ok() && channel_id == 1 {
+            // Print stack-ish info: this fire happened, with FIFO count for context
+            let fifo_count = self.apu.fifo_a.count;
+            let fifo_b_count = self.apu.fifo_b.count;
+            let refill_req_a = self.apu.fifo_a.refill_request_count;
+            let refill_req_b = self.apu.fifo_b.refill_request_count;
+            let timing = self.dma.channels[1].timing();
+            eprintln!(
+                "  run_dma(1) timing={:?} fifo_a_count={} fifo_b_count={} \
+                 refill_req_a={} refill_req_b={}",
+                timing, fifo_count, fifo_b_count, refill_req_a, refill_req_b
+            );
+        }
+        let ch = &self.dma.channels[channel_id];
 
         let word32 = ch.word_size_32();
         let word_size: u32 = if word32 { 4 } else { 2 };
@@ -753,6 +768,9 @@ impl Bus {
             0x0C4 => self.dma.channels[1].count = val,
             0x0C6 => {
                 if let Some(_ch) = self.write_dma_control(1, val) {
+                    if std::env::var("DMA_FIRE_TRACE").is_ok() {
+                        eprintln!("    [from CPU write to DMA1 control / Immediate]");
+                    }
                     self.run_dma(1);
                 }
             }

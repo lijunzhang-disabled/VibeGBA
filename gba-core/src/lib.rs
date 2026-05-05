@@ -313,9 +313,41 @@ impl Gba {
                     // so that games which assume the behaviour but don't
                     // explicitly call SWI 0x1D still work.
                     // See debug/2026-04-25_pokemon-audio-dma-reanchor.md
+                    let dma_audio_trace = std::env::var("DMA_AUDIO_TRACE").is_ok();
+                    if dma_audio_trace {
+                        let fa = &self.bus.apu.fifo_a;
+                        eprintln!(
+                            "[FIFO_A] count={} push={} pop={} refill_req={} dropped={}",
+                            fa.count, fa.push_count, fa.pop_count,
+                            fa.refill_request_count, fa.push_dropped_count
+                        );
+                        for ch in 0..4 {
+                            let c = &self.bus.dma.channels[ch];
+                            if c.active {
+                                eprintln!(
+                                    "[DMA{}] active timing={:?} ctl=0x{:04X} \
+                                     sad=0x{:08X} dad=0x{:08X} count=0x{:04X} \
+                                     run_count={}",
+                                    ch, c.timing(), c.control,
+                                    c.sad & 0x07FF_FFFF, c.dad,
+                                    c.count, c.run_count
+                                );
+                            }
+                        }
+                    }
                     for ch in [1usize, 2] {
                         let c = &mut self.bus.dma.channels[ch];
                         if c.active && matches!(c.timing(), dma::DmaTiming::Special) {
+                            if dma_audio_trace {
+                                let advance = c.internal_sad
+                                    .wrapping_sub(c.sad & 0x07FF_FFFF);
+                                eprintln!(
+                                    "[DMA{}] vbl: sad=0x{:08X} internal_sad=0x{:08X} \
+                                     advanced={} bytes → re-anchor",
+                                    ch, c.sad & 0x07FF_FFFF, c.internal_sad,
+                                    advance
+                                );
+                            }
                             c.internal_sad = c.sad & 0x07FF_FFFF;
                         }
                     }
@@ -362,17 +394,53 @@ impl Gba {
             }
         }
 
-        // Timer 0/1 overflow: advance FIFO samples and trigger DMA refill
+        // Timer 0/1 overflow: advance FIFO samples and trigger DMA refill.
+        //
+        // CRITICAL: only fire the DMA channel whose destination address
+        // matches the FIFO that requested refill. Without this filter, an
+        // empty FIFO_B (which can stay empty if a game uses only FIFO_A)
+        // requests refill on every timer overflow → run_dma_for_timing
+        // would fire ALL Special-timed channels including DMA1, causing
+        // DMA1 to over-push samples to FIFO_A (which is already full).
+        // SRTOG hits this — observed DMA1 firing 352 ×/frame instead of
+        // the expected 22 ×/frame for its 21024 Hz sample rate.
+        const FIFO_A_ADDR: u32 = 0x0400_00A0;
+        const FIFO_B_ADDR: u32 = 0x0400_00A4;
+
         if result.timer0_overflow {
             let (fifo_a_refill, fifo_b_refill) = self.bus.apu.on_timer_overflow(0);
-            if fifo_a_refill || fifo_b_refill {
-                self.run_dma_for_timing(DmaTiming::Special);
-            }
+            if fifo_a_refill { self.run_dma_for_fifo(FIFO_A_ADDR); }
+            if fifo_b_refill { self.run_dma_for_fifo(FIFO_B_ADDR); }
         }
         if result.timer1_overflow {
             let (fifo_a_refill, fifo_b_refill) = self.bus.apu.on_timer_overflow(1);
-            if fifo_a_refill || fifo_b_refill {
-                self.run_dma_for_timing(DmaTiming::Special);
+            if fifo_a_refill { self.run_dma_for_fifo(FIFO_A_ADDR); }
+            if fifo_b_refill { self.run_dma_for_fifo(FIFO_B_ADDR); }
+        }
+    }
+
+    /// Run DMA channels in Special timing whose destination is the given
+    /// FIFO register. Used by FIFO refill triggering so that a low FIFO_A
+    /// only fires the DMA writing to FIFO_A, not arbitrary other Special
+    /// channels.
+    fn run_dma_for_fifo(&mut self, fifo_addr: u32) {
+        for ch_id in 0..4 {
+            let c = &self.bus.dma.channels[ch_id];
+            if c.enabled() && c.active
+                && c.timing() == DmaTiming::Special
+                && (c.dad & 0x07FF_FFFF) == (fifo_addr & 0x07FF_FFFF)
+            {
+                let (_cycles, irq) = self.bus.run_dma(ch_id);
+                if irq {
+                    let irq_type = match ch_id {
+                        0 => interrupt::Irq::Dma0,
+                        1 => interrupt::Irq::Dma1,
+                        2 => interrupt::Irq::Dma2,
+                        3 => interrupt::Irq::Dma3,
+                        _ => continue,
+                    };
+                    self.bus.interrupt.request_irq(irq_type);
+                }
             }
         }
     }

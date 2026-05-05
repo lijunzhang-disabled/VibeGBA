@@ -35,56 +35,23 @@ not sufficient — both fixes are needed for round-trip saves to work.
 
 ## High priority — known correctness bugs
 
-### 0. Super Robot Taisen: Original Generation — visuals fixed; audio NOT playable
+### 0. Super Robot Taisen: Original Generation — visuals + most audio fixed; residual
 Status: visual path fixed (chip ID, see
-`debug/2026-04-30_srtog-flash-chip-id.md`). Game boots past chip-ID
-gate, music plays. **Audio is still not playable** — the "zizizi"
-comb-tone changed character (no longer the tight 1880 Hz cluster
-after commit af3b9ba added halt-period APU ticking) but it was
-replaced by a constant-amplitude background noise loud enough that
-the user can barely hear the music.
+`debug/2026-04-30_srtog-flash-chip-id.md`). Major audio bug fixed
+2026-05-05 — the constant 59 Hz noise floor that was drowning out
+the music came from FIFO_B underflow cross-triggering DMA1 to over-
+push FIFO_A; see
+`debug/2026-05-05_srtog-fifo-b-cross-trigger.md`. Music is now
+audible.
 
-Spectrum signature: top peak now at 59.3 Hz, suspiciously close to
-GBA frame rate (59.737 Hz). RMS-over-time on SRTOG never drops to
-silence (min RMS 826) while Pokémon does (min RMS 0) — so it's an
-always-present output, not music.
+Remaining audio issues (lower priority):
+- A periodic component still audible "on top" of normal sound
+- Combat scenes have noticeable distortion
 
-Pokémon (the only confirmed-clean game) is unaffected by the halt-
-period APU change because Pokémon busy-waits and never halts. The
-SRTOG noise floor only appears in halt-using games.
-
-Ruled out via A/B testing:
-- APU fast-path bulk-accumulate vs per-cycle: APU_NO_FAST_PATH=1
-  sounds the same noisy.
-- Mixer scale 120× vs 100×: same sound.
-- 1-stage vs 3-stage IIR: 3-stage muffles music without removing
-  noise.
-- Reverting halt-period APU ticking entirely restores the original
-  "zizizi" buzz — so we have two bad sounds and no clean one.
-
-Suspects worth investigating next:
-1. **DMA re-anchor at vblank.** We set `internal_sad = sad` for
-   DMA1/2 every vblank. If the buffer length doesn't match one
-   frame's FIFO consumption (350 samples at 21024 Hz), we skip or
-   over-read at each vblank — producing a 60 Hz periodic glitch
-   matching our observed 59.3 Hz peak. Diagnostic: log per-vblank
-   how many bytes DMA actually transferred between re-anchors;
-   compare to expected ~350.
-2. **SOUNDBIAS not applied at output.** We read into `bias_level`
-   but never subtract from output. Could be a constant DC component
-   or low-frequency rumble.
-3. **Halt-period sub-step phasing.** Our chunk-to-next-overflow
-   sub-stepping is correct in principle but might be sensitive to
-   off-by-one on overflow timing. Worth comparing the FIFO pop
-   cycle counts vs slow path.
-4. **Sample-and-hold spectral images.** FIFO at 21024 Hz creates
-   spectral images at 20–22 kHz. A proper sinc-interpolation between
-   FIFO samples would suppress these.
-
-Reproduction: `WAV_DUMP=/tmp/srtog.wav ./target/release/gba-frontend
-~/Documents/SuperRobotTaisen-OriginalGeneration.gba`, then
-`/tmp/wav_analyze.py /tmp/srtog.wav` — top peak should be at ~59 Hz
-with min RMS > 800 (constant background).
+Possibly different roots — dual-FIFO content (where SRTOG actually
+uses FIFO_B during combat for SFX) might trip a related but not
+identical bug. Worth re-running the WAV/spectrum analysis on a
+combat-scene capture.
 
 ### 1. 8-bit Flash region: 16-bit / 32-bit writes
 Status: known-incomplete  

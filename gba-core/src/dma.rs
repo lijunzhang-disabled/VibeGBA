@@ -35,6 +35,10 @@ pub struct DmaChannel {
     pub internal_count: u32,
     /// Whether this channel is currently active (enabled + timing matched)
     pub active: bool,
+    /// Diagnostic: cumulative count of run_dma calls. Useful for tracking
+    /// whether FIFO DMAs fire at the expected rate.
+    #[serde(default, skip)]
+    pub run_count: u64,
 }
 
 impl DmaChannel {
@@ -48,6 +52,7 @@ impl DmaChannel {
             internal_dad: 0,
             internal_count: 0,
             active: false,
+            run_count: 0,
         }
     }
 

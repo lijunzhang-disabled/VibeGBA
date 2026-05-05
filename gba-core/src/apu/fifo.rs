@@ -18,7 +18,7 @@ pub struct FifoChannel {
     /// Write position
     write_pos: usize,
     /// Number of samples in buffer
-    count: usize,
+    pub count: usize,
     /// Current sample being played (latched on timer tick)
     pub current_sample: i8,
     /// Which timer drives this channel (0 or 1)
@@ -28,6 +28,15 @@ pub struct FifoChannel {
     pub enable_right: bool,
     /// Volume: false = 50%, true = 100%
     pub volume_full: bool,
+    /// Diagnostic: cumulative push and pop counts for vblank tracing.
+    #[serde(default, skip)]
+    pub push_count: u64,
+    #[serde(default, skip)]
+    pub pop_count: u64,
+    #[serde(default, skip)]
+    pub refill_request_count: u64,
+    #[serde(default, skip)]
+    pub push_dropped_count: u64,
 }
 
 impl FifoChannel {
@@ -42,6 +51,10 @@ impl FifoChannel {
             enable_left: false,
             enable_right: false,
             volume_full: false,
+            push_count: 0,
+            pop_count: 0,
+            refill_request_count: 0,
+            push_dropped_count: 0,
         }
     }
 
@@ -75,6 +88,9 @@ impl FifoChannel {
             self.buffer[self.write_pos] = sample;
             self.write_pos = (self.write_pos + 1) % FIFO_CAPACITY;
             self.count += 1;
+            self.push_count += 1;
+        } else {
+            self.push_dropped_count += 1;
         }
     }
 
@@ -85,9 +101,14 @@ impl FifoChannel {
             self.current_sample = self.buffer[self.read_pos];
             self.read_pos = (self.read_pos + 1) % FIFO_CAPACITY;
             self.count -= 1;
+            self.pop_count += 1;
         }
         // Request DMA refill when half empty
-        self.count <= 16
+        let need_refill = self.count <= 16;
+        if need_refill {
+            self.refill_request_count += 1;
+        }
+        need_refill
     }
 
     /// Get the current output sample scaled to the mixer range.
