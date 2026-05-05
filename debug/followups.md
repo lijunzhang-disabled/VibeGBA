@@ -4,7 +4,7 @@ Tracking known issues, accuracy gaps, and "we'll get to it later" items
 across the emulator. Per-bug investigation logs go in dated files; this is
 the rolling list of things still worth doing.
 
-Last reviewed: **2026-04-29** (after fixing Pokémon save flakiness).
+Last reviewed: **2026-05-05** (after SRTOG buzz fix; residual noise still open).
 
 ## ✅ RESOLVED: Pokémon Emerald save flakiness (commit b29226f)
 
@@ -35,58 +35,58 @@ not sufficient — both fixes are needed for round-trip saves to work.
 
 ## High priority — known correctness bugs
 
-### 0. Super Robot Taisen: Original Generation — visuals fixed; audio buzzy
-Status: visual path resolved 2026-04-30 (chip ID). Audio sounds buzzy
-("zizizi") with a slow amplitude wobble — same class of issue as
-Pokémon's residual noise (item #1 below).
+### 0. Super Robot Taisen: Original Generation — visuals fixed; audio NOT playable
+Status: visual path fixed (chip ID, see
+`debug/2026-04-30_srtog-flash-chip-id.md`). Game boots past chip-ID
+gate, music plays. **Audio is still not playable** — the "zizizi"
+comb-tone changed character (no longer the tight 1880 Hz cluster
+after commit af3b9ba added halt-period APU ticking) but it was
+replaced by a constant-amplitude background noise loud enough that
+the user can barely hear the music.
 
-What's working: game boots past chip-ID gate, title screen renders
-(`dispcnt=0x0300`), state machine progresses through 0x32 → 0x3C →
-0x46 → 0x64 → … (verified via MEM_WATCH). State transitions queue
-correctly and complete.
+Spectrum signature: top peak now at 59.3 Hz, suspiciously close to
+GBA frame rate (59.737 Hz). RMS-over-time on SRTOG never drops to
+silence (min RMS 826) while Pokémon does (min RMS 0) — so it's an
+always-present output, not music.
 
-Visual fix: see `debug/2026-04-30_srtog-flash-chip-id.md`. Our
-hardcoded 64 KB Atmel chip ID wasn't in SRTOG's supported-chip
-table, so the game treated save hardware as broken and parked the
-state machine on its 0xFFFF sentinel. `pick_chip_id()` now scans the
-ROM for any known chip-ID and returns the first match (Panasonic >
-SST > Macronix > Sanyo > Atmel for 64 KB; Macronix variants > Sanyo
-for 128 KB). Pokémon (128 KB) and SRTOG (64 KB) both boot correctly.
+Pokémon (the only confirmed-clean game) is unaffected by the halt-
+period APU change because Pokémon busy-waits and never halts. The
+SRTOG noise floor only appears in halt-using games.
 
-Audio: see item #1.
+Ruled out via A/B testing:
+- APU fast-path bulk-accumulate vs per-cycle: APU_NO_FAST_PATH=1
+  sounds the same noisy.
+- Mixer scale 120× vs 100×: same sound.
+- 1-stage vs 3-stage IIR: 3-stage muffles music without removing
+  noise.
+- Reverting halt-period APU ticking entirely restores the original
+  "zizizi" buzz — so we have two bad sounds and no clean one.
 
-### 1. Audio mixer: SRTOG buzz (Pokémon now clean)
-Status: partially resolved. Pokémon Emerald audio is correct after
-commit a14c551 (cached hot-path env-var lookups — was running at
-~10 % real-time, causing buffer-underrun "buzz" that we'd been
-chasing as a mixer issue). See
-`debug/2026-05-04_env-var-hot-path-perf.md`.
+Suspects worth investigating next:
+1. **DMA re-anchor at vblank.** We set `internal_sad = sad` for
+   DMA1/2 every vblank. If the buffer length doesn't match one
+   frame's FIFO consumption (350 samples at 21024 Hz), we skip or
+   over-read at each vblank — producing a 60 Hz periodic glitch
+   matching our observed 59.3 Hz peak. Diagnostic: log per-vblank
+   how many bytes DMA actually transferred between re-anchors;
+   compare to expected ~350.
+2. **SOUNDBIAS not applied at output.** We read into `bias_level`
+   but never subtract from output. Could be a constant DC component
+   or low-frequency rumble.
+3. **Halt-period sub-step phasing.** Our chunk-to-next-overflow
+   sub-stepping is correct in principle but might be sensitive to
+   off-by-one on overflow timing. Worth comparing the FIFO pop
+   cycle counts vs slow path.
+4. **Sample-and-hold spectral images.** FIFO at 21024 Hz creates
+   spectral images at 20–22 kHz. A proper sinc-interpolation between
+   FIFO samples would suppress these.
 
-SRTOG still buzzes ("zizizi"). M4A-style game like Pokémon, but
-sound is more demanding and the buzz didn't go away with the perf
-fix. Remaining suspects worth chasing:
+Reproduction: `WAV_DUMP=/tmp/srtog.wav ./target/release/gba-frontend
+~/Documents/SuperRobotTaisen-OriginalGeneration.gba`, then
+`/tmp/wav_analyze.py /tmp/srtog.wav` — top peak should be at ~59 Hz
+with min RMS > 800 (constant background).
 
-1. **Mixer clipping.** `apu/mod.rs::emit_sample` scales averaged
-   samples by 120× then clamps to ±32 767. Theoretical peak signal
-   (4 × PSG ± 15 plus 2 × FIFO ± 128) × 120 ≈ ±37 920 — clamps every
-   loud peak, and clipped square-wave edges produce buzz.
-2. **PSG output range doubled.** `psg.rs` outputs ±envelope_volume
-   for high/low duty (range −15..+15), but real hardware outputs
-   0..15 unsigned (range −7..+8 after DC removal). Our PSG is
-   roughly 2× too loud, contributing to the clipping above.
-3. **SOUNDCNT_H DSA/DSB volume bits.** Need to verify we apply the
-   50 % / 100 % direct-sound volume scaling correctly.
-4. **Boxcar averaging artifact.** 349-sample boxcar at 48 kHz output;
-   linear-phase but with poor stop-band attenuation.
-
-We tried reducing the scale to 100×, cascading 3 IIR stages, and
-ticking timers/APU during halt periods. None of those alone fixed
-SRTOG and one of them broke Pokémon, so they were reverted. Right
-way forward is probably an A/B against an mGBA reference recording
-on the same ROM at known frames, then tune scale + PSG range
-together until peaks match without clipping.
-
-### 2. 8-bit Flash region: 16-bit / 32-bit writes
+### 1. 8-bit Flash region: 16-bit / 32-bit writes
 Status: known-incomplete  
 `bus::write16` / `write32` for `0x0E…/0x0F…` currently fall through to
 no-op. Per gbatek, real hardware should write the LSB byte. We tried
@@ -96,7 +96,7 @@ Next time: identify *which* code path Pokémon takes that depends on the
 write being dropped, OR figure out what the hang's root cause is.
 Reads are correct (8-bit broadcast, fixed in 64b04c0).
 
-### 3. `bios.gba` test 001 — BIOS stale-bus latch
+### 2. `bios.gba` test 001 — BIOS stale-bus latch
 Status: known-failing  
 Test reads from address 0 outside BIOS context and expects the last
 BIOS-fetched instruction (`0xE129F000`) to be returned (open-bus latch).
@@ -106,7 +106,7 @@ BIOS execution. Doesn't affect any real game.
 
 ## Medium priority — accuracy gaps
 
-### 4. Wait state emulation (`WAITCNT`)
+### 3. Wait state emulation (`WAITCNT`)
 Status: not modelled  
 Every memory access takes 1 cycle in our emulator. Real GBA has variable
 wait states for ROM (configurable via WAITCNT 0x04000204), EWRAM (3
@@ -116,20 +116,20 @@ Doesn't break anything observable so far, but cycle-tight games
 (precision platformers, anything polling I/O in tight inner loops) could
 expose timing bugs.
 
-### 5. Game Pak prefetch buffer
+### 4. Game Pak prefetch buffer
 Status: not modelled  
 The GBA Game Pak has a small instruction prefetch buffer that hides ROM
 wait states for sequential code execution. Without modelling it, ROM
-fetch is artificially slow — but since (4) is also missing, the two
-inaccuracies partially cancel.
+fetch is artificially slow — but since item 3 (WAITCNT) is also
+missing, the two inaccuracies partially cancel.
 
-### 6. Open-bus read accuracy
+### 5. Open-bus read accuracy
 Status: simplified  
 Currently we return `last_read` for unmapped memory reads. Real
 behaviour depends on what was last fetched (CPU pipeline state, last
 DMA, etc.). Edge cases likely diverge from real hardware.
 
-### 7. Misaligned ARM access quirks
+### 6. Misaligned ARM access quirks
 Status: partial  
 We fixed misaligned `LDRH` rotation (`addr & 1` rotates result right by
 8). ARM has similar quirks for:
@@ -140,7 +140,7 @@ review against the ARM ARM spec.
 
 ## Low priority — wide-coverage / nice-to-have
 
-### 8. Missing BIOS SWIs
+### 7. Missing BIOS SWIs
 Status: ~22 of ~40 SWIs implemented (see header comment in
 `gba-core/src/bios.rs`).  
 Notable missing ones:
@@ -156,7 +156,7 @@ Most modern Game Boy Advance commercial games ship their own audio
 driver and don't depend on these. But some older / simpler games rely on
 the BIOS audio path.
 
-### 9. Test more commercial games
+### 8. Test more commercial games
 Status: only Pokémon Emerald + jsmolka test ROMs exercised.  
 Bring up at least a handful of representatives:
 - Pokémon Ruby/Sapphire (same M4A engine, should work)
@@ -170,7 +170,7 @@ Each will probably surface 1–3 new accuracy bugs. The way to bring this
 up is "boot it, take screenshots at known frames, eyeball or diff
 against mGBA captures."
 
-### 10. Audio: real-BIOS sound SWI testing
+### 9. Audio: real-BIOS sound SWI testing
 Status: unverified  
 Once we land more sound SWIs (item 8), validate against games that
 specifically use them. Note: HLE will never be perfect for games that
@@ -178,7 +178,7 @@ expect cycle-exact BIOS sound timing — those should use a real BIOS dump.
 
 ## Tooling / UX
 
-### 11. Save state vs `.sav` interaction
+### 10. Save state vs `.sav` interaction
 Status: works but confusing.  
 Currently:
 - `.sav` is rewritten on emulator exit from current Flash state.
@@ -191,7 +191,7 @@ Possible improvements:
   conflicting actions.
 - Or just document this behaviour clearly in a README.
 
-### 12. Diagnostic instrumentation cleanup
+### 11. Diagnostic instrumentation cleanup
 Status: env-gated, not affecting runtime.  
 Several debug prints are in the codebase, all gated by env vars
 (`FLASH_TRACE`, `IRQ_TRACE`, `INSTR_TRACE_RING`, `DUMP_PC`). They're
@@ -201,14 +201,14 @@ env, or move to a separate debug crate.
 
 ## Frontend
 
-### 13. Better save state UX
+### 12. Better save state UX
 Status: bare-bones (`]` save, `[` load).  
 Could add:
 - Multiple save state slots (`Shift+1`–`9`).
 - Visual confirmation when state is saved/loaded.
 - Auto-save state on exit.
 
-### 14. Configurable controls
+### 13. Configurable controls
 Status: hardcoded.  
 Mapping is fixed in `gba-frontend/src/input.rs`. A config file or
 runtime arguments would make it easier for users with different
