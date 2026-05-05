@@ -33,6 +33,11 @@ fn dispcnt_trace_enabled() -> bool {
     *V.get_or_init(|| std::env::var("DISPCNT_TRACE").is_ok())
 }
 
+fn dma_fire_trace_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DMA_FIRE_TRACE").is_ok())
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Bus {
     /// 16KB BIOS ROM
@@ -430,7 +435,7 @@ impl Bus {
             return (0, false);
         }
         self.dma.channels[channel_id].run_count += 1;
-        if std::env::var("DMA_FIRE_TRACE").is_ok() && channel_id == 1 {
+        if dma_fire_trace_enabled() && channel_id == 1 {
             // Print stack-ish info: this fire happened, with FIFO count for context
             let fifo_count = self.apu.fifo_a.count;
             let fifo_b_count = self.apu.fifo_b.count;
@@ -768,7 +773,7 @@ impl Bus {
             0x0C4 => self.dma.channels[1].count = val,
             0x0C6 => {
                 if let Some(_ch) = self.write_dma_control(1, val) {
-                    if std::env::var("DMA_FIRE_TRACE").is_ok() {
+                    if dma_fire_trace_enabled() {
                         eprintln!("    [from CPU write to DMA1 control / Immediate]");
                     }
                     self.run_dma(1);

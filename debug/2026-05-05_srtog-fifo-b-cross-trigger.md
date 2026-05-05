@@ -1,7 +1,98 @@
 # SRTOG audio: FIFO_B empty cross-triggering DMA1 → over-pushing FIFO_A
 
 Date: 2026-05-05
-Status: **Fixed** (commit pending)
+Status: **Fixed** (commit 1c1c488)
+
+## Plain-English summary
+
+Whenever **either** FIFO needed more data, our emulator was firing
+**every** active "FIFO DMA" channel — so an empty FIFO_B (which SRTOG
+never used) was making us refill FIFO_A even when FIFO_A was already
+full.
+
+### What's a FIFO and why does this matter?
+
+The GBA has two Direct Sound channels, **FIFO_A** and **FIFO_B**.
+Each is a tiny 32-byte queue between the game and the audio hardware:
+
+- The game produces audio samples and pushes them into a FIFO via
+  DMA from EWRAM.
+- A timer counts down at the audio sample rate (e.g. 21 024 Hz for
+  SRTOG). Every timer overflow, the audio hardware **pops** one
+  sample from the FIFO and sends it to the DAC.
+- When the FIFO drops below half-full, the DMA controller refills
+  it.
+
+Most M4A games (Pokémon, SRTOG, etc.) use **only FIFO_A** for music
+and leave FIFO_B unconfigured. FIFO_B never gets filled, never gets
+read by the game, just stays empty. That's normal.
+
+### The pop-and-request mechanism
+
+In our emulator, every Timer 0 overflow ran roughly:
+
+```
+pop one sample from FIFO_A  (because FIFO_A.timer_select = 0)
+pop one sample from FIFO_B  (because FIFO_B.timer_select = 0 too)
+if either pop_sample said "I'm getting low, refill me":
+    run all DMA channels with timing=Special
+```
+
+Two important details:
+
+1. We pop **both** FIFOs on Timer 0 overflow (because both default
+   `timer_select = 0`, and we never gate on whether the FIFO is
+   actually being used).
+2. Our `pop_sample` for FIFO_B always returns "refill me" — because
+   FIFO_B's count is 0, and `0 ≤ 16` is true. Even though FIFO_B is
+   empty deliberately and nobody cares.
+
+### The cross-trigger
+
+When FIFO_B says "refill me," our code called
+`run_dma_for_timing(Special)`, which runs **every** active DMA
+channel set to "Special" (FIFO) timing:
+
+- DMA1 (active, writes to FIFO_A) ← fires!
+- DMA2 (not configured by SRTOG) ← skipped
+
+So DMA1 fires every time **FIFO_B** asks for a refill, even though
+FIFO_A doesn't need one. DMA1 dutifully reads 16 bytes from EWRAM
+and tries to push them into FIFO_A. FIFO_A is already at 32/32
+capacity, so 15 of those 16 bytes are silently dropped on the floor
+by `push_byte`'s `if count < FIFO_CAPACITY` guard. But the **source
+pointer still advances 16 bytes** because that's what
+`internal_sad += 4 × 4` does unconditionally.
+
+Per frame at 21 024 Hz that's 350 timer overflows. So:
+
+- 22 legit refills triggered by FIFO_A actually needing data (correct)
+- 350 spurious refills triggered by FIFO_B's "I'm always empty"
+  complaint (bug)
+- Total: 352 DMA1 fires per frame
+
+The source pointer races through EWRAM 16× faster than it should,
+reading bytes that were never meant to be played, and most of them
+get dropped before reaching FIFO_A anyway. The vblank handler then
+yanks the source pointer back to the buffer start. Repeat 60×/sec —
+and the periodic chaos at frame rate shows up as the 59 Hz constant
+noise we kept seeing in the spectrum.
+
+### Why Pokémon worked all along
+
+Pokémon configures **both** DMA1→FIFO_A *and* DMA2→FIFO_B, even if
+its music doesn't actively use both. So FIFO_B's "refill me"
+requests had a legitimate target (DMA2), and DMA2 happily did its
+work (transferring whatever zeros or silence M4A had written to its
+B-buffer). The same `run_dma_for_timing(Special) → fires all Special
+channels` behavior was running both DMA1 and DMA2 every time, but
+for Pokémon both were *supposed* to fire, so the bug was invisible.
+
+SRTOG only ever configured DMA1, never DMA2 — so the same code path
+that was harmless for Pokémon caused DMA1 to fire 16× too often. A
+perfect example of why "two games behave the same on real hardware
+but differently in our emulator" almost always points to a code path
+that's only correct under the more constrained game's assumptions.
 
 ## Symptom
 
