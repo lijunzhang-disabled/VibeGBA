@@ -38,6 +38,11 @@ fn dma_fire_trace_enabled() -> bool {
     *V.get_or_init(|| std::env::var("DMA_FIRE_TRACE").is_ok())
 }
 
+fn win_trace_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("WIN_TRACE").is_ok())
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Bus {
     /// 16KB BIOS ROM
@@ -739,10 +744,32 @@ impl Bus {
             0x03C => self.io.write_bg_ref_low(3, 1, val),
             0x03E => self.io.write_bg_ref_high(3, 1, val),
             // Window
-            0x040 => self.io.winh[0] = val,
-            0x042 => self.io.winh[1] = val,
-            0x044 => self.io.winv[0] = val,
-            0x046 => self.io.winv[1] = val,
+            0x040 => {
+                if win_trace_enabled() {
+                    eprintln!("[WIN] WIN0H = 0x{:04X}  (X1={}, X2={})  vcount={}",
+                        val, val >> 8, val & 0xFF, self.io.vcount);
+                }
+                self.io.winh[0] = val;
+            }
+            0x042 => {
+                if win_trace_enabled() {
+                    eprintln!("[WIN] WIN1H = 0x{:04X}  vcount={}", val, self.io.vcount);
+                }
+                self.io.winh[1] = val;
+            }
+            0x044 => {
+                if win_trace_enabled() {
+                    eprintln!("[WIN] WIN0V = 0x{:04X}  (Y1={}, Y2={})  vcount={}",
+                        val, val >> 8, val & 0xFF, self.io.vcount);
+                }
+                self.io.winv[0] = val;
+            }
+            0x046 => {
+                if win_trace_enabled() {
+                    eprintln!("[WIN] WIN1V = 0x{:04X}  vcount={}", val, self.io.vcount);
+                }
+                self.io.winv[1] = val;
+            }
             0x048 => self.io.winin = val,
             0x04A => self.io.winout = val,
             0x04C => self.io.mosaic = val,

@@ -265,8 +265,19 @@ impl Gba {
                     self.bus.interrupt.request_irq(interrupt::Irq::HBlank);
                 }
 
-                // Trigger HBlank DMA
-                self.run_dma_for_timing(dma::DmaTiming::HBlank);
+                // Trigger HBlank DMA — but ONLY for visible scanlines
+                // (0..159). Real GBA does not fire HBlank DMA during
+                // VBlank lines (160..227). Without this gate, games like
+                // Pokémon Emerald that stream a 160-entry per-scanline
+                // table via HBlank DMA (e.g. the cave-flash circle on
+                // WIN0H) have their source pointer drift ~68 entries per
+                // frame during VBlank, so by the time visible line 0
+                // renders, the WIN0H value is already the table's middle
+                // entries — the circle equator ends up at the top of the
+                // screen instead of the middle.
+                if line < VISIBLE_LINES {
+                    self.run_dma_for_timing(dma::DmaTiming::HBlank);
+                }
 
                 // Schedule end of HBlank (start of next scanline)
                 self.scheduler.schedule(Event {
