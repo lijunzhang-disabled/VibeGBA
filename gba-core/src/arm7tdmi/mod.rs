@@ -25,6 +25,22 @@ fn irq_trace_enabled() -> bool {
     *V.get_or_init(|| std::env::var("IRQ_TRACE").is_ok())
 }
 
+/// FE7-specific probe: prints IF/IE/IME state at three key PCs in FE7's
+/// ARM IRQ handler so we can pinpoint *when* a new HBlank IRQ becomes
+/// pending during the ack→MSR window.
+///
+///   0x03003A1C — just before `STRH R0, [R3, #2]` (the ack to REG_IF)
+///   0x03003A20 — just after that ack
+///   0x03003A30 — just before `MSR CPSR_FC, R3` (which re-enables IRQs)
+///
+/// If IF is clear at A20 but set at A30, something is re-asserting IF in
+/// the ~12 cycles between — pointing at a scheduler issue. If IF stays
+/// set at A20, the ack itself isn't reaching write_if correctly.
+fn fe7_probe_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("FE7_PROBE").is_ok())
+}
+
 /// ARM7TDMI CPU modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CpuMode {
@@ -248,6 +264,24 @@ impl Cpu {
             crate::push_trace_arm(pc, self.pipeline[0],
                 self.regs[0], self.regs[1], self.regs[2], self.regs[3],
                 self.regs[13], self.regs[14]);
+        }
+        if fe7_probe_enabled() {
+            let pc = self.regs[15].wrapping_sub(8);
+            if pc == 0x03003950 || pc == 0x03003A20 || pc == 0x03003A30 || pc == 0x03003A48 {
+                let ie = bus.interrupt.ie;
+                let ir = bus.interrupt.ir;
+                let dispstat = bus.io.dispstat;
+                let vcount = bus.io.vcount;
+                // At 0x3950 / 0x3A20 / 0x3A30 the CPU is in IRQ mode
+                // (handler hasn't switched modes yet), so regs[13] IS sp_irq.
+                let sp = self.regs[13];
+                eprintln!(
+                    "[FE7] pc={pc:08X} ie=0x{ie:04X} if=0x{ir:04X} \
+                     dispstat=0x{dispstat:04X} vc={vcount} \
+                     r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} sp=0x{:08X}",
+                    self.regs[0], self.regs[1], self.regs[2], self.regs[3], sp
+                );
+            }
         }
         // Invariant: at start of step, regs[15] = executing_instruction_address + 8.
         // This matches the ARM7TDMI spec where PC reads during execution return PC+8.

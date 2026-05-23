@@ -288,7 +288,24 @@ impl Gba {
 
                 // Fire HBlank IRQ if enabled
                 if self.bus.io.dispstat & 0x0010 != 0 {
-                    self.bus.interrupt.request_irq(interrupt::Irq::HBlank);
+                    static DISABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    let disabled = *DISABLE.get_or_init(|| {
+                        std::env::var("DISABLE_HBLANK_IRQ").is_ok()
+                    });
+                    if !disabled {
+                        self.bus.interrupt.request_irq(interrupt::Irq::HBlank);
+                    }
+                    static HBLANK_IRQ_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    let trace = *HBLANK_IRQ_TRACE.get_or_init(|| {
+                        std::env::var("HBLANK_IRQ_TRACE").is_ok()
+                    });
+                    if trace {
+                        eprintln!(
+                            "[HB-IRQ] vc={} time={} ir=0x{:04X} ie=0x{:04X}",
+                            line, current_time,
+                            self.bus.interrupt.ir, self.bus.interrupt.ie,
+                        );
+                    }
                 }
 
                 // Trigger HBlank DMA — but ONLY for visible scanlines
