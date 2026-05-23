@@ -28,13 +28,28 @@ pub struct TraceEntry {
     pub sp: u32, pub lr: u32,
 }
 
-const TRACE_RING_SIZE: usize = 256;
+const TRACE_RING_SIZE: usize = 32768;
 static TRACE_RING: Mutex<Option<Box<[TraceEntry; TRACE_RING_SIZE]>>> = Mutex::new(None);
 static TRACE_HEAD: Mutex<usize> = Mutex::new(0);
 static TRACE_FROZEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn pc_in_valid_code(pc: u32) -> bool {
     matches!(pc >> 24, 0x00 | 0x02 | 0x03 | 0x08 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D)
+}
+
+/// Optional "freeze trace ring when PC first reaches this address" env var.
+/// Set TRACE_FREEZE_PC=0xADDR (hex) to capture the 256 instructions BEFORE
+/// the CPU reaches a known-bad PC — used for diagnosing hangs where the
+/// stuck-in-loop pattern means a normal trace ring just shows the loop
+/// repeating endlessly, with no path-into-the-loop visible.
+fn trace_freeze_at_pc() -> Option<u32> {
+    use std::sync::OnceLock;
+    static V: OnceLock<Option<u32>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TRACE_FREEZE_PC").ok().and_then(|s| {
+            u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+        })
+    })
 }
 
 fn ensure_ring() {
@@ -47,11 +62,10 @@ fn ensure_ring() {
 pub fn push_trace_thumb(pc: u32, op: u16, r0: u32, r1: u32, r2: u32, r3: u32, sp: u32, lr: u32) {
     if TRACE_FROZEN.load(std::sync::atomic::Ordering::Relaxed) { return; }
     ensure_ring();
-    if !pc_in_valid_code(pc) {
-        // First invalid PC — freeze the ring so the dump captures the
-        // last 256 valid instructions BEFORE the escape.
+    if !pc_in_valid_code(pc) || trace_freeze_at_pc() == Some(pc) {
+        // First invalid PC or first hit of TRACE_FREEZE_PC — freeze the
+        // ring so the dump captures the last 256 instructions BEFORE.
         TRACE_FROZEN.store(true, std::sync::atomic::Ordering::Relaxed);
-        // Push the escape entry too so we can see the bad target.
     }
     let mut head = TRACE_HEAD.lock().unwrap();
     let mut ring = TRACE_RING.lock().unwrap();
@@ -64,7 +78,7 @@ pub fn push_trace_thumb(pc: u32, op: u16, r0: u32, r1: u32, r2: u32, r3: u32, sp
 pub fn push_trace_arm(pc: u32, op: u32, r0: u32, r1: u32, r2: u32, r3: u32, sp: u32, lr: u32) {
     if TRACE_FROZEN.load(std::sync::atomic::Ordering::Relaxed) { return; }
     ensure_ring();
-    if !pc_in_valid_code(pc) {
+    if !pc_in_valid_code(pc) || trace_freeze_at_pc() == Some(pc) {
         TRACE_FROZEN.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let mut head = TRACE_HEAD.lock().unwrap();
@@ -184,6 +198,14 @@ impl Gba {
                     let now = self.scheduler.timestamp();
                     let total_gap = (step_target - now) as u32;
                     let mut remaining = total_gap;
+                    static HALT_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    let trace = *HALT_TRACE.get_or_init(|| std::env::var("HALT_TRACE").is_ok());
+                    if trace {
+                        eprintln!("[HALT] enter gap={} now={} step_target={} T0_cnt=0x{:04X} T0_ctl=0x{:04X}",
+                            total_gap, now, step_target,
+                            self.bus.timers.timers[0].counter,
+                            self.bus.timers.timers[0].control);
+                    }
                     while remaining > 0 {
                         let to_next = self.bus.timers.cycles_to_next_fifo_overflow();
                         // Cap to remaining; also cap to a safety max in case
@@ -196,6 +218,10 @@ impl Gba {
                         self.scheduler.add_cycles(chunk as u64);
                         self.tick_timers(chunk);
                         remaining -= chunk;
+                    }
+                    if trace {
+                        eprintln!("[HALT] exit  T0_cnt=0x{:04X}",
+                            self.bus.timers.timers[0].counter);
                     }
                     break;
                 }

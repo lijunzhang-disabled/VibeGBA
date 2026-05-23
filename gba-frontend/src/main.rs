@@ -135,6 +135,21 @@ fn dump_ewram(gba: &Gba) {
     }
 }
 
+/// Dump the 32 KB IWRAM (0x03000000..0x03007FFF) to /tmp/iwram-<N>.bin.
+/// Triggered by 'I'. Useful for inspecting runtime-loaded code (IRQ
+/// handlers, vsync wrappers, etc.) that don't live in ROM.
+fn dump_iwram(gba: &Gba) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = format!("/tmp/iwram-{:03}.bin", n);
+    match fs::write(&path, gba.bus.iwram_ref()) {
+        Ok(()) => eprintln!("IWRAM snapshot written to {}  ({} bytes)",
+                            path, gba.bus.iwram_ref().len()),
+        Err(e) => eprintln!("Failed to write IWRAM snapshot: {}", e),
+    }
+}
+
 /// Dump the metatile behavior at the player's current tile (M key).
 /// Pokemon Emerald (BPEE US) specific — walks gObjectEvents → gBackupMapLayout
 /// → gMapHeader.mapLayout → tileset.metatileAttributes to extract the
@@ -420,6 +435,17 @@ fn main() {
                     // EWRAM snapshot: D — dumps EWRAM to /tmp/ewram-<N>.bin
                     // for diff-based diagnostics (Pokémon map bug, etc).
                     sdl2::keyboard::Keycode::D => dump_ewram(&gba),
+                    // IWRAM snapshot: I — dumps IWRAM to /tmp/iwram-<N>.bin
+                    // for inspecting runtime-loaded code (IRQ handlers, etc).
+                    sdl2::keyboard::Keycode::I => dump_iwram(&gba),
+                    // Trace ring on-demand dump: R. Prints the last 256
+                    // instructions executed (requires INSTR_TRACE_RING=1).
+                    // Useful for "stuck but PC is in valid memory" hangs
+                    // where the auto-dump-on-escape never fires.
+                    sdl2::keyboard::Keycode::R => {
+                        eprintln!("[TRACE_RING manual dump]");
+                        gba_core::dump_trace_ring();
+                    },
                     // Metatile probe: M — dumps metatile behavior at player tile
                     // (BPEE Emerald specific; for the Granite Cave hole-vs-ladder bug).
                     sdl2::keyboard::Keycode::M => dump_metatile_at_player(&gba),
@@ -533,6 +559,18 @@ fn main() {
                         gba.cpu.regs[0], gba.cpu.regs[1], gba.cpu.regs[2], gba.cpu.regs[3],
                         gba.cpu.regs[4], gba.cpu.regs[5], gba.cpu.regs[6], gba.cpu.regs[7],
                         gba.cpu.regs[13], gba.cpu.regs[14],
+                    );
+                    // Timer state snapshot — when triaging hangs that look
+                    // like "halted waiting for a Timer IRQ", we need to see
+                    // whether each timer is enabled, what its counter is,
+                    // and whether its IRQ enable bit is set. control fields:
+                    //   bit 7 = enable, bit 6 = IRQ enable, bits 0-1 = prescaler.
+                    eprintln!(
+                        "[TIM] T0 ctl=0x{:04X} cnt=0x{:04X} rld=0x{:04X} | T1 ctl=0x{:04X} cnt=0x{:04X} rld=0x{:04X} | T2 ctl=0x{:04X} T3 ctl=0x{:04X}",
+                        gba.bus.timers.timers[0].control, gba.bus.timers.timers[0].counter, gba.bus.timers.timers[0].reload,
+                        gba.bus.timers.timers[1].control, gba.bus.timers.timers[1].counter, gba.bus.timers.timers[1].reload,
+                        gba.bus.timers.timers[2].control,
+                        gba.bus.timers.timers[3].control,
                     );
                     // One-time dump of the user IRQ handler at [0x03007FFC].
                     // Useful when triaging a "boots but stays black" game —
