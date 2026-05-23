@@ -231,6 +231,61 @@ session.
 - `V` key on Map 2 confirms `var 0x4022 = 0x2004` (the low halfword of the
   BIOS open-bus latch).
 
+## Why this bug only surfaced in the cave
+
+A natural question: the emulator had been running Pokémon Emerald for
+thousands of frames before the cave — opening, menus, the overworld,
+battles, the entire pre-cave story — without any visible problem. Why
+did this BIOS open-bus bug only trigger here?
+
+Four conditions had to align simultaneously:
+
+1. **Game code had to read from BIOS region (0x00..0x3FFF) with PC in
+   ROM.** The vast majority of CPU memory accesses in a game don't go
+   through `read_bios` at all — they hit ROM, EWRAM, IWRAM, VRAM, OAM,
+   palette, or I/O. SWI calls *execute* BIOS code (PC enters BIOS,
+   read_bios's "PC in BIOS" branch handles them correctly); they
+   don't *read data* from BIOS with PC in ROM. The realistic way to
+   land at BIOS-region addresses with PC in ROM is a NULL pointer
+   dereference, which game code generally avoids.
+
+2. **Specifically a `*srcPtr` deref where srcPtr happens to be NULL.**
+   In BPEE this only occurs in `ScrCmd_copyvar`. Other "set var"
+   commands don't have this shape:
+
+   - `setvar destVar, literal` (opcode 0x16) — the literal is read
+     straight from script bytecode and stored. No pointer deref. Safe.
+   - `VarGet(id)` — if `GetVarPointer(id)` returns NULL, it returns
+     `id` itself as the literal. NULL-safe.
+   - `ScrCmd_copyvar` (opcode 0x19) — BPEE's compiled body is
+     `*destPtr = *srcPtr` (`LDRH r0, [r0]; STRH r0, [r5]`),
+     skipping the VarGet NULL check entirely. For
+     `srcVar < VARS_START`, `srcPtr = NULL`, the LDRH lands on BIOS
+     address 0, and the value depends on the open-bus latch.
+
+   So the bug needs the unusual `copyvar destVar, <low_literal>`
+   idiom. Game authors generally prefer `setvar` for literals.
+
+3. **The script's effect had to be checked against zero.** Even when
+   `copyvar destVar, <low_literal>` *is* used, it only matters if
+   something later cares whether the value is zero or not. Many uses
+   write to scratch vars that get overwritten before being read, or
+   compare with `>`/`<` ranges where exact zero doesn't matter.
+   Map (24, 8)'s `ON_FRAME_TABLE` has a `value == 0` comparison —
+   the strictest possible check.
+
+4. **And the comparison had to gate a *destructive* action.** Plenty of
+   on-frame entries gate cosmetic effects (animation flips, encounter
+   tables, NPC visibility). Map (24, 8) gates a **warphole** — an
+   immediate map transition that moves the player. The result is
+   instantly visible and breaks navigation, so a "got the wrong value"
+   bug here can't hide.
+
+Map (24, 8) is the perfect storm. Other BPEE locations could, in
+principle, exhibit the same root cause if they hit the four conditions
+above, but the cave's ladder-landing tile is the spot you encounter
+in normal gameplay. Until then the bug sat dormant.
+
 ## Lessons
 
 1. **A `// TODO` for a niche hardware quirk hid a game-breaking dependency.**
