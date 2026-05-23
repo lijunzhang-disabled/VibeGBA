@@ -120,6 +120,178 @@ fn save_sav(gba: &Gba, path: &Path) {
 }
 
 /// Save state (F5): serialize + zstd compress.
+/// Dump EWRAM (256 KB) to /tmp/ewram-<N>.bin where N is the next free
+/// number. Triggered by pressing 'D' in the frontend. Used for diff-
+/// based debugging — snapshot at point A and B, find changed bytes.
+fn dump_ewram(gba: &Gba) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = format!("/tmp/ewram-{:03}.bin", n);
+    match fs::write(&path, gba.bus.ewram_ref()) {
+        Ok(()) => eprintln!("EWRAM snapshot written to {}  ({} bytes)",
+                            path, gba.bus.ewram_ref().len()),
+        Err(e) => eprintln!("Failed to write EWRAM snapshot: {}", e),
+    }
+}
+
+/// Dump the metatile behavior at the player's current tile (M key).
+/// Pokemon Emerald (BPEE US) specific — walks gObjectEvents → gBackupMapLayout
+/// → gMapHeader.mapLayout → tileset.metatileAttributes to extract the
+/// behavior byte for the tile the player is standing on.
+fn dump_metatile_at_player(gba: &Gba) {
+    let bus = &gba.bus;
+    let p = |a| bus.peek8(a);
+    let p32 = |a| bus.peek32(a);
+
+    // gObjectEvents[0].currentCoords (BPEE: 0x02037350, +0x10 = x, +0x12 = y).
+    // currentCoords includes MAP_OFFSET (=7); they are direct indices into the
+    // bordered map array, no further adjustment needed.
+    let px = i16::from_le_bytes([p(0x02037360), p(0x02037361)]);
+    let py = i16::from_le_bytes([p(0x02037362), p(0x02037363)]);
+
+    // gBackupMapLayout (BPEE IWRAM 0x03005DC0): { s32 width; s32 height; u16 *map; }
+    let width   = p32(0x03005DC0) as i32;
+    let height  = p32(0x03005DC4) as i32;
+    let map_ptr = p32(0x03005DC8);
+
+    let idx = (py as i32) * width + (px as i32);
+    let mt_addr = map_ptr.wrapping_add((idx as u32).wrapping_mul(2));
+    let mt_raw  = u16::from_le_bytes([p(mt_addr), p(mt_addr.wrapping_add(1))]);
+    let mt_id   = mt_raw & 0x03FF;
+
+    // gMapHeader (BPEE EWRAM 0x02037318): first field is mapLayout pointer.
+    let layout_ptr   = p32(0x02037318);
+    // struct MapLayout: { width, height, *border, *map, *primaryTileset, *secondaryTileset, ... }
+    let prim_tileset = p32(layout_ptr.wrapping_add(0x10));
+    let sec_tileset  = p32(layout_ptr.wrapping_add(0x14));
+
+    // struct Tileset: metatileAttributes is at offset 0x10. In original BPEE
+    // the attributes are u16 (2 bytes each), NOT u32 — confirmed by raw ROM
+    // dump. The low byte is the behavior, the high byte holds terrain/layer
+    // flags. NUM_METATILES_IN_PRIMARY = 0x200.
+    let (tileset_ptr, local_id) = if mt_id < 0x200 {
+        (prim_tileset, mt_id as u32)
+    } else {
+        (sec_tileset, (mt_id - 0x200) as u32)
+    };
+    let attrs_ptr  = p32(tileset_ptr.wrapping_add(0x10));
+    let attr_addr  = attrs_ptr.wrapping_add(local_id.wrapping_mul(2));
+    let attrs_word = u16::from_le_bytes([p(attr_addr), p(attr_addr.wrapping_add(1))]);
+    let behavior   = (attrs_word & 0xFF) as u8;
+
+    // gPlayerAvatar (BPEE 0x02037590): flags(0), transitionFlags(1),
+    // runningState(2), tileTransitionState(3). The "just-landed-from-warp"
+    // state is expected to live in one of these (most likely flags or
+    // tileTransitionState) — we log all four so the diff is greppable.
+    let pa_flags  = p(0x02037590);
+    let pa_trans  = p(0x02037591);
+    let pa_run    = p(0x02037592);
+    let pa_tile   = p(0x02037593);
+
+    // gObjectEvents[0] first 4 bytes are 32 packed bitfield bits: active,
+    // singleMovementActive, triggerGroundEffectsOnMove, triggerGroundEffects-
+    // OnStop, disableCoveringGroundEffects, landingJump, heldMovementActive,
+    // heldMovementFinished, frozen, … Log the whole word and decode offline.
+    let obj_bits  = p32(0x02037350);
+
+    eprintln!(
+        "METATILE player=({px},{py}) behavior=0x{behavior:02X} attrs=0x{attrs_word:04X} \
+         id=0x{mt_id:03X} layout w={width} h={height} map=0x{map_ptr:08X} idx={idx} raw=0x{mt_raw:04X} \
+         layoutPtr=0x{layout_ptr:08X} prim=0x{prim_tileset:08X} sec=0x{sec_tileset:08X} attrsPtr=0x{attrs_ptr:08X} \
+         playerAvatar=[flags=0x{pa_flags:02X} trans=0x{pa_trans:02X} run=0x{pa_run:02X} tile=0x{pa_tile:02X}] \
+         objBits=0x{obj_bits:08X}"
+    );
+}
+
+/// Dump game var values for the BPEE Emerald investigation. Triggered by 'V'.
+///
+/// BPEE's GetVarPointer at 0x0809D648 computes:
+///     addr = *gSaveBlock1Ptr + (var_id << 1) + 0xFFFF939C
+/// Rearranging, vars[N - VARS_START] lives at:
+///     sb1Ptr + 0x139C + (N - 0x4000) * 2
+/// i.e. vars[0] = sb1Ptr + 0x139C. (Not 0x1490 — master pokeemerald has
+/// re-laid-out SaveBlock1 since BPEE shipped.)
+fn dump_vars(gba: &Gba) {
+    let bus = &gba.bus;
+    let sb1 = bus.peek32(0x03005D8C);
+    if sb1 == 0 {
+        eprintln!("VARS gSaveBlock1Ptr is null — no map loaded yet?");
+        return;
+    }
+    let p16 = |a: u32| u16::from_le_bytes([bus.peek8(a), bus.peek8(a.wrapping_add(1))]);
+    let base = sb1.wrapping_add(0x139C); // vars[0]
+    eprintln!("VARS sb1=0x{sb1:08X} vars_base=0x{base:08X}");
+    for off in 0x20..0x28 {
+        let var_id = 0x4000 + off;
+        let addr   = base.wrapping_add((off as u32) * 2);
+        let val    = p16(addr);
+        let marker = if var_id == 0x4022 { " <-- Map 2 on-frame trigger" } else { "" };
+        eprintln!("  var 0x{var_id:04X} @ 0x{addr:08X} = 0x{val:04X}{marker}");
+    }
+}
+
+/// Walk Map 2's script table (gMapHeader.mapScripts, BPEE +0x08 = 0x02037320),
+/// printing every top-level entry. For ON_FRAME_TABLE (type=2) and
+/// ON_WARP_INTO_MAP_TABLE (type=4), also dumps the sub-table of
+/// {var, value, script_ptr} triples — these are how the map auto-runs
+/// scripts when game variables match. Triggered by pressing 'S' in-game.
+fn dump_map_scripts(gba: &Gba) {
+    let bus = &gba.bus;
+    let p   = |a| bus.peek8(a);
+    let p16 = |a: u32| u16::from_le_bytes([bus.peek8(a), bus.peek8(a.wrapping_add(1))]);
+    // bus.peek32 force-aligns to 4 bytes; map-script entries are 5 bytes each
+    // (1 type + 4 ptr) so subsequent ptr fields are unaligned. Build the u32
+    // from four byte reads instead.
+    let p32u = |a: u32| u32::from_le_bytes([
+        bus.peek8(a), bus.peek8(a.wrapping_add(1)),
+        bus.peek8(a.wrapping_add(2)), bus.peek8(a.wrapping_add(3)),
+    ]);
+    let p32 = |a| bus.peek32(a);
+
+    let ms_ptr = p32(0x02037320); // gMapHeader.mapScripts
+    eprintln!("MAPSCRIPTS table=0x{ms_ptr:08X}");
+
+    let mut e = ms_ptr;
+    for _ in 0..16 {  // safety bound
+        let ty = p(e);
+        if ty == 0 {
+            eprintln!("  end");
+            break;
+        }
+        // Each top-level entry is 1 byte (type) + 4 bytes (script/table ptr) = 5 bytes
+        let sub_ptr = p32u(e.wrapping_add(1));
+        let label = match ty {
+            1 => "ON_LOAD",
+            2 => "ON_FRAME_TABLE",
+            3 => "ON_TRANSITION",
+            4 => "ON_WARP_INTO_MAP_TABLE",
+            5 => "ON_RESUME",
+            6 => "ON_DIVE_WARP",
+            7 => "ON_RETURN_TO_FIELD",
+            _ => "?",
+        };
+        eprintln!("  type=0x{ty:02X} ({label}) ptr=0x{sub_ptr:08X}");
+
+        if ty == 2 || ty == 4 {
+            // Sub-table of {u16 var, u16 value, u32 script_ptr} = 8 bytes per entry.
+            let mut t = sub_ptr;
+            for _ in 0..32 {
+                let var = p16(t);
+                if var == 0 {
+                    eprintln!("    end");
+                    break;
+                }
+                let val    = p16(t.wrapping_add(2));
+                let script = p32u(t.wrapping_add(4));
+                eprintln!("    var=0x{var:04X} value=0x{val:04X} script=0x{script:08X}");
+                t = t.wrapping_add(8);
+            }
+        }
+        e = e.wrapping_add(5);
+    }
+}
+
 fn save_state(gba: &Gba, path: &Path) {
     match gba.save_state() {
         Ok(data) => {
@@ -222,6 +394,13 @@ fn main() {
     let dump_pc = std::env::var("DUMP_PC").is_ok();
     let mut frame_count: u64 = 0;
 
+    // TILE_TRACE=1 polls player tile coords each frame and dumps the metatile
+    // behavior whenever they change. Use for catching short-lived tiles (e.g.
+    // landing-then-falling-again in Granite Cave) where pressing M by hand is
+    // racy. BPEE Emerald specific.
+    let tile_trace = std::env::var("TILE_TRACE").is_ok();
+    let mut last_player_xy: (i16, i16) = (i16::MIN, i16::MIN);
+
     // Main emulation loop
     'running: loop {
         let frame_start = Instant::now();
@@ -238,6 +417,18 @@ fn main() {
                     sdl2::keyboard::Keycode::RightBracket => save_state(&gba, &state),
                     // Load state: [ (left bracket) — "restore back"
                     sdl2::keyboard::Keycode::LeftBracket => load_state(&mut gba, &state),
+                    // EWRAM snapshot: D — dumps EWRAM to /tmp/ewram-<N>.bin
+                    // for diff-based diagnostics (Pokémon map bug, etc).
+                    sdl2::keyboard::Keycode::D => dump_ewram(&gba),
+                    // Metatile probe: M — dumps metatile behavior at player tile
+                    // (BPEE Emerald specific; for the Granite Cave hole-vs-ladder bug).
+                    sdl2::keyboard::Keycode::M => dump_metatile_at_player(&gba),
+                    // Map script table: S — walks gMapHeader.mapScripts and dumps
+                    // ON_FRAME_TABLE / ON_WARP_INTO_MAP_TABLE var/value/script triples.
+                    sdl2::keyboard::Keycode::S => dump_map_scripts(&gba),
+                    // Vars probe: V — dumps the values of game vars around 0x4022
+                    // (the var that gates the auto-warp on Map 2).
+                    sdl2::keyboard::Keycode::V => dump_vars(&gba),
                     _ => {}
                 },
                 _ => {}
@@ -288,6 +479,15 @@ fn main() {
                 }
             }
             display.render(gba.framebuffer());
+
+            if tile_trace {
+                let px = i16::from_le_bytes([gba.bus.peek8(0x02037360), gba.bus.peek8(0x02037361)]);
+                let py = i16::from_le_bytes([gba.bus.peek8(0x02037362), gba.bus.peek8(0x02037363)]);
+                if (px, py) != last_player_xy {
+                    dump_metatile_at_player(&gba);
+                    last_player_xy = (px, py);
+                }
+            }
 
             if dump_pc {
                 frame_count += 1;

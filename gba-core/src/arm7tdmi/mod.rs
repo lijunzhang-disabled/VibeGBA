@@ -283,7 +283,6 @@ impl Cpu {
                 self.regs[0], self.regs[1], self.regs[2], self.regs[3],
                 self.regs[13], self.regs[14]);
         }
-
         let cycles = self.execute_thumb(bus, opcode);
 
         if !self.pipeline_flushed {
@@ -310,11 +309,18 @@ impl Cpu {
     fn refill_pipeline(&mut self, bus: &mut Bus) {
         if self.cpsr.thumb() {
             let pc = self.regs[15] & !1;
+            // Update bus.last_pc to the actual fetch PC so the BIOS-read
+            // protection check (which uses last_pc to gate "PC in BIOS" vs
+            // "PC outside BIOS" behavior) sees the correct value when this
+            // refill targets a different region than the previous step
+            // (e.g. an IRQ entry jumping from ROM to BIOS 0x18).
+            bus.last_pc = pc;
             self.pipeline[0] = bus.read16(pc) as u32;
             self.pipeline[1] = bus.read16(pc + 2) as u32;
             self.regs[15] = pc + 4;
         } else {
             let pc = self.regs[15] & !3;
+            bus.last_pc = pc;
             self.pipeline[0] = bus.read32(pc);
             self.pipeline[1] = bus.read32(pc + 4);
             self.regs[15] = pc + 8;

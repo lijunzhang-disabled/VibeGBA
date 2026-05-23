@@ -117,6 +117,16 @@ impl Bus {
             keypad: Keypad::new(),
             rtc,
             last_read: 0,
+            // Initial BIOS open-bus latch is 0. The latch is updated naturally
+            // each time the CPU executes BIOS code — most notably during the
+            // IRQ handler stub at BIOS 0x18, which runs every IRQ. Pokémon
+            // games run VBlankIntrWait very early, so by the time gameplay
+            // scripts execute the latch holds 0xE25EF004 (last instruction of
+            // the IRQ stub). This is what makes BPEE's `copyvar destVar,
+            // <literal_under_0x4000>` idiom work — LDRH at NULL returns the
+            // low halfword of the latch (0xF004), which becomes the value
+            // stored, so the trigger var becomes non-zero and the on-frame
+            // warphole-gate stays armed.
             bios_latch: 0,
             has_bios,
             halt_requested: false,
@@ -415,6 +425,28 @@ impl Bus {
     pub fn iwram_mut(&mut self) -> &mut [u8] { &mut self.iwram }
     pub fn ewram_ref(&self) -> &[u8] { &self.ewram }
 
+    /// Side-effect-free byte read for debug tooling. Covers EWRAM/IWRAM/ROM
+    /// only — the regions debug code actually walks (struct fields, ROM
+    /// pointers). Unmapped regions return 0.
+    pub fn peek8(&self, addr: u32) -> u8 {
+        match addr >> 24 {
+            0x02 => self.ewram[(addr & 0x3FFFF) as usize],
+            0x03 => self.iwram[(addr & 0x7FFF) as usize],
+            0x08..=0x0D => {
+                let offset = (addr & 0x01FF_FFFF) as usize;
+                if offset < self.rom.len() { self.rom[offset] } else { 0 }
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn peek32(&self, addr: u32) -> u32 {
+        let a = addr & !3;
+        u32::from_le_bytes([
+            self.peek8(a), self.peek8(a + 1), self.peek8(a + 2), self.peek8(a + 3),
+        ])
+    }
+
     /// True when the backup chip is mid-command-sequence. Used by the
     /// EXPERIMENT_GATE in cpu::step() to test the "IRQs during flash"
     /// hypothesis.
@@ -527,14 +559,32 @@ impl Bus {
     // ─── Internal helpers ─────────────────────────────────────────
 
     fn read_bios(&mut self, addr: u32) -> u8 {
-        // TODO: proper BIOS read protection (only readable when PC is in BIOS)
-        let index = (addr & 0x3FFF) as usize;
-        if index < self.bios.len() {
-            let val = self.bios[index];
-            self.bios_latch = val as u32;
-            val
+        // Real GBA hardware: the BIOS ROM is only readable while PC is inside
+        // the BIOS region (0x00000000..0x00004000). When PC is anywhere else
+        // (typically game ROM), the bus returns a byte of the last fetched
+        // BIOS instruction, latched in `bios_latch`. Returning 0 here breaks
+        // games that rely on the open-bus value being non-zero (e.g. Pokémon
+        // Emerald's `copyvar destVar, literal` idiom; see ScrCmd_copyvar).
+        if self.last_pc < 0x0000_4000 {
+            let index = (addr & 0x3FFF) as usize;
+            if index + 3 < self.bios.len() {
+                // Latch the full 32-bit word containing this read so future
+                // open-bus reads see a coherent instruction word.
+                let word_idx = index & !3;
+                self.bios_latch = u32::from_le_bytes([
+                    self.bios[word_idx], self.bios[word_idx + 1],
+                    self.bios[word_idx + 2], self.bios[word_idx + 3],
+                ]);
+                self.bios[index]
+            } else if index < self.bios.len() {
+                self.bios[index]
+            } else {
+                0
+            }
         } else {
-            0
+            // PC outside BIOS: return the appropriate byte of the latched word.
+            let shift = (addr & 3) * 8;
+            ((self.bios_latch >> shift) & 0xFF) as u8
         }
     }
 
@@ -895,6 +945,25 @@ fn make_hle_bios() -> Vec<u8> {
         bios[a + 2] = bytes[2];
         bios[a + 3] = bytes[3];
     }
+
+    // BIOS open-bus latch: the ARM7TDMI pipeline always fetches two
+    // instructions ahead, so when the IRQ stub at 0x18..0x2C finishes
+    // the advance-fetch after the LDMFD step at 0x28 lands at 0x30 —
+    // *past* the stub. On real GBA hardware that fetch hits actual BIOS
+    // code and leaves the bus latch holding a sensible word (post-
+    // IntrWait the canonical value is 0xE3A02004 = MOV r2, #4). Pokémon
+    // Emerald's BPEE binary relies on this: ScrCmd_copyvar implements
+    // `*destPtr = *srcPtr` and for srcVar < VARS_START (e.g. the
+    // 0x0001 literal in Map 2's ON_TRANSITION `copyvar 0x4022, 1`)
+    // GetVarPointer returns NULL → the LDRH reads from address 0 →
+    // BIOS open-bus returns the latch's low halfword (0x2004). Without
+    // that non-zero value the trigger var stays 0 and Map 2's on-frame
+    // warphole gate fires every frame, dropping the player to Map 3.
+    let post_latch = 0xE3A02004u32.to_le_bytes();
+    bios[0x30] = post_latch[0];
+    bios[0x31] = post_latch[1];
+    bios[0x32] = post_latch[2];
+    bios[0x33] = post_latch[3];
 
     bios
 }
