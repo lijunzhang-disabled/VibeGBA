@@ -393,3 +393,98 @@ that prevents the per-wake-up mixer invocations from accumulating.
    `vc >= 160` over a frame. If we deliver HBlank IRQs during VBlank
    that real GBA doesn't, fixing that gate should fix FE7 without
    requiring `DISABLE_HBLANK_IRQ=1`.
+
+## Update 2026-05-24 part 5: full audio call chain mapped
+
+Used `INSTR_TRACE_RING=1 TRACE_FREEZE_PC=0x030031AC` to freeze the trace
+ring at the first mixer entry. The 32K-instruction tail shows the
+COMPLETE call chain:
+
+```
+0x0801529C  audio engine MAIN function (tick-list entry; not BL'd, called
+            via function pointer — appears in 9 ROM tables as 0x0801529D)
+  ↓ BL 0x6A64 (with R0=0)
+0x08006A64  channel-loop function:
+              PUSH {R4, LR}
+              R4 = R0*16 + 0x0202A48C  (channel array base)
+              if R4=0 return
+              loop:
+                R2 = [R4+12]            (channel.field_12 = sample data ptr)
+                if R2=0 → skip
+                R0 = signed [R4+4]
+                R1 = signed [R4+6]
+                R3 = ushort [R4+8]
+                BL 0x08004388             ← THUNK
+                R4 = [R4+0]             (next node)
+                if R4 != 0 → loop
+              POP {R4, R0}; BX R0
+  ↓ BL 0x08004388
+0x08004388  THUNK (one of a family at 0x4338 / 0x4360 / 0x4388 / 0x43B4):
+              PUSH {R4, R7, LR}; SUB SP #16; MOV R7,SP
+              save args (R0..R3) to stack
+              R0 = literal = 0x03002920
+              restore R1, R2, R3 from stack
+              R4 = [R0] = 0x030031AC  (mixer function pointer from RAM)
+              R0 = [R7] (restore R0)
+              BL 0x080BFC5C            ← DISPATCHER
+              ... return ...
+  ↓ BL 0x080BFC5C
+0x080BFC5C  DISPATCHER (a BX-table; 0x4720 = BX R4)
+              BX R4   →   0x030031AC (the M4A mixer in IWRAM)
+```
+
+So the M4A architecture is:
+* A **tick-list entry** at `0x0801529C` is called per audio-engine-update
+  step.
+* It calls a **channel iterator** at `0x08006A64` twice (with `R0=0` and
+  `R0=13` — likely separate channel sets, MUSIC vs SFX).
+* The iterator walks a **linked list of channels** at `[0x0202A48C + R0*16]`.
+* For each active channel (`channel.field_12 != 0`), it calls a thunk
+  that resolves to the mixer at `0x030031AC` via the pointer table at
+  `0x03002920`.
+
+This explains the call rate: mixer calls per frame =
+`(audio_engine_main_calls_per_frame) × (num_active_channels)`.
+
+In our emulator we see ~33 batches/frame × ~8 calls/batch ≈ 264 entries
+in the 0x2930 buffer → overflow at 192.
+
+Real FE7 must have:
+* (audio_engine_main called less often per frame), AND/OR
+* (fewer active channels in the list).
+
+### Where to pick up next next
+
+1. **Find audio engine main's caller**: it's invoked via function-pointer
+   table. The 9 ROM occurrences of `0x0801529D` are in tables at
+   `0x08012718`, `0x08012B2C`, `0x0801B974`, `0x0802E0DC/178/204/304`,
+   `0x08055800`, `0x0806B9B0`. Some are FE7's per-mode "tick list" tables
+   (one per game-state). Find which tick list is currently active and
+   how often it gets iterated. If it iterates more than once per frame
+   in our emulator, that's the bug.
+
+2. **Count `0x0801529C` entries per frame**: add a one-shot probe that
+   counts BL into 0x0801529C per VBlank period. If our count > 1, our
+   tick-driver runs too often.
+
+3. **Verify channel list contents**: dump `[0x0202A48C]..[0x0202A48C + 16]`
+   (the channel array for R0=0) and follow the linked list. Count
+   active channels. Compare to known FE7 reference (mp2k engine spec
+   says 8 channels max for music). If we somehow have more active
+   channels than real FE7, that's the bug.
+
+Tools added this round:
+* No new env vars. Used existing `INSTR_TRACE_RING=1` + `TRACE_FREEZE_PC=0xADDR`
+  + R key for ring dump.
+
+ROM disassembly notes:
+* Mixer entry: `0x030031AC` (ARM)
+* HBlank subhandler: `0x080BB354` (THUMB) — per-line BG/palette effects
+* Audio engine main: `0x0801529C` (THUMB)
+* Channel iterator: `0x08006A64` (THUMB)
+* Thunk: `0x08004388` (THUMB, plus siblings at 0x4338, 0x4360, 0x43B4)
+* Dispatcher: `0x080BFC5C` (THUMB, BX-table)
+* Mixer function-pointer slot: `0x03002920` (RAM, holds 0x030031AC)
+* HBlank subhandler pointer slot: `0x03002924` (RAM, holds 0x080BB355)
+* Mixer write-pointer: `0x03002F34` (RAM, advances 0x2930→0x2F30 per frame)
+* Channel array base: `0x0202A48C` (EWRAM)
