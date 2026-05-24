@@ -173,11 +173,6 @@ pub struct Cpu {
     pub halted: bool,
     /// Pending SWI comment (set by SWI instruction, consumed by Gba::step).
     pub(crate) pending_swi: Option<u8>,
-    /// SWI 0x04/0x05 IntrWait mask (0 = not waiting). When non-zero, the
-    /// CPU re-halts after each IRQ delivery unless the matching bit was
-    /// set in the BIOS_IF mirror at 0x03007FF8.
-    #[serde(default)]
-    pub intrwait_mask: u16,
 }
 
 impl Cpu {
@@ -191,7 +186,6 @@ impl Cpu {
             irq_entries: 0,
             halted: false,
             pending_swi: None,
-            intrwait_mask: 0,
         };
         // ARM7TDMI starts in ARM mode, Supervisor, at address 0x00000000
         // The BIOS will set up the stack pointers and jump to the ROM
@@ -238,27 +232,11 @@ impl Cpu {
         let gate_irq = experiment_gate_enabled()
             && bus.backup_busy();
 
-        // IntrWait HLE re-halt logic. When user code called SWI 0x04/0x05
-        // we stashed the wait mask in intrwait_mask and set halted=true.
-        // The halt-wake check in lib.rs clears `halted` on ANY pending IRQ
-        // (correct ARM7TDMI behavior). After the IRQ handler runs and
-        // returns to user mode, we end up here in non-IRQ mode with the
-        // wait still pending. Check the BIOS_IF mirror: if our requested
-        // bits are set, the wait is satisfied (clear those bits + wait).
-        // If not, re-halt so we keep waiting. Skips in IRQ mode so we
-        // don't re-halt while the IRQ handler is running.
-        if self.intrwait_mask != 0
-            && self.cpsr.mode() != CpuMode::Irq
-            && self.cpsr.mode() != CpuMode::Supervisor
-        {
-            let bios_if = bus.read16(0x0300_7FF8);
-            if bios_if & self.intrwait_mask != 0 {
-                bus.write16(0x0300_7FF8, bios_if & !self.intrwait_mask);
-                self.intrwait_mask = 0;
-            } else if !self.halted {
-                self.halted = true;
-            }
-        }
+        // (FE7 investigation: previously had IntrWait HLE re-halt logic
+        // here, but it only affects 3 init SWI 0x05 calls — FE7's main
+        // loop doesn't use SWI 0x05 to wait for VBlank, so the audio
+        // buffer cascade isn't fixed by gating SWI 0x05. Reverted.
+        // See debug/2026-05-24_fe7-hblank-irq-cascade.md.)
 
         // Check for pending interrupts
         if !gate_irq && bus.interrupt.has_pending() && !self.cpsr.irq_disabled() {
@@ -504,18 +482,11 @@ impl Cpu {
 
     /// Handle an IRQ interrupt.
     fn handle_interrupt(&mut self, bus: &mut Bus) {
-        // Update the BIOS IRQ-flags mirror at IWRAM 0x03007FF8.
-        // The real BIOS's IRQ stub ORs the pending IE&IF bits into this
-        // mirror BEFORE invoking the user handler, so that SWI 0x04/0x05
-        // (IntrWait / VBlankIntrWait) can detect which IRQ woke them up.
-        // The user handler is responsible for clearing the matching bits
-        // in the mirror when the wait is satisfied — typically done by the
-        // SWI loop itself, not by the user IRQ handler.
-        let pending = bus.interrupt.ie & bus.interrupt.ir;
-        if pending != 0 {
-            let bios_if = bus.read16(0x0300_7FF8);
-            bus.write16(0x0300_7FF8, bios_if | pending);
-        }
+        // (FE7 investigation: previously updated BIOS_IF mirror at
+        // 0x03007FF8 here to support proper SWI 0x04/0x05 wait. Reverted
+        // because FE7's main loop doesn't use SWI 0x05 for VBlank-sync
+        // and the change didn't address the actual cascade. See debug
+        // doc for details.)
 
         let return_addr = if self.cpsr.thumb() {
             self.regs[15] // PC is already ahead by 4 in THUMB

@@ -40,7 +40,21 @@ static TRACE_HEAD: Mutex<usize> = Mutex::new(0);
 static TRACE_FROZEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn pc_in_valid_code(pc: u32) -> bool {
-    matches!(pc >> 24, 0x00 | 0x02 | 0x03 | 0x08 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D)
+    // PCs valid for instruction execution:
+    //   BIOS:   0x00000000..0x00003FFF
+    //   EWRAM:  0x02000000..0x0203FFFF (256 KB)
+    //   IWRAM:  0x03000000..0x03007FFF (32 KB)
+    //   ROM:    0x08000000..0x0DFFFFFF (with mirrors 0x09..0x0D)
+    // NOT valid: VRAM (0x06xxxxxx) — VRAM is data, not code.
+    // Treating VRAM as valid masks runaway-PC bugs where PC escapes into
+    // VRAM mirror space (e.g., 0x06FD7000) and the CPU executes garbage.
+    match pc >> 24 {
+        0x00 => pc < 0x0000_4000,
+        0x02 => pc < 0x0204_0000,
+        0x03 => pc < 0x0300_8000,
+        0x08..=0x0D => true,
+        _ => false,
+    }
 }
 
 /// Optional "freeze trace ring when PC first reaches this address" env var.
@@ -68,9 +82,8 @@ fn ensure_ring() {
 pub fn push_trace_thumb(pc: u32, op: u16, r0: u32, r1: u32, r2: u32, r3: u32, sp: u32, lr: u32) {
     if TRACE_FROZEN.load(std::sync::atomic::Ordering::Relaxed) { return; }
     ensure_ring();
-    if !pc_in_valid_code(pc) || trace_freeze_at_pc() == Some(pc) {
-        // First invalid PC or first hit of TRACE_FREEZE_PC — freeze the
-        // ring so the dump captures the last 256 instructions BEFORE.
+    let should_freeze = !pc_in_valid_code(pc) || trace_freeze_at_pc() == Some(pc);
+    if should_freeze {
         TRACE_FROZEN.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let mut head = TRACE_HEAD.lock().unwrap();
@@ -79,12 +92,19 @@ pub fn push_trace_thumb(pc: u32, op: u16, r0: u32, r1: u32, r2: u32, r3: u32, sp
         r[*head] = TraceEntry { pc, op: op as u32, thumb: true, r0, r1, r2, r3, sp, lr };
         *head = (*head + 1) % TRACE_RING_SIZE;
     }
+    drop(ring);
+    drop(head);
+    if should_freeze {
+        eprintln!("=== TRACE FREEZE: pc=0x{pc:08X} thumb op=0x{op:04X} ===");
+        dump_trace_ring();
+    }
 }
 
 pub fn push_trace_arm(pc: u32, op: u32, r0: u32, r1: u32, r2: u32, r3: u32, sp: u32, lr: u32) {
     if TRACE_FROZEN.load(std::sync::atomic::Ordering::Relaxed) { return; }
     ensure_ring();
-    if !pc_in_valid_code(pc) || trace_freeze_at_pc() == Some(pc) {
+    let should_freeze = !pc_in_valid_code(pc) || trace_freeze_at_pc() == Some(pc);
+    if should_freeze {
         TRACE_FROZEN.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let mut head = TRACE_HEAD.lock().unwrap();
@@ -92,6 +112,12 @@ pub fn push_trace_arm(pc: u32, op: u32, r0: u32, r1: u32, r2: u32, r3: u32, sp: 
     if let Some(r) = ring.as_mut() {
         r[*head] = TraceEntry { pc, op, thumb: false, r0, r1, r2, r3, sp, lr };
         *head = (*head + 1) % TRACE_RING_SIZE;
+    }
+    drop(ring);
+    drop(head);
+    if should_freeze {
+        eprintln!("=== TRACE FREEZE: pc=0x{pc:08X} arm op=0x{op:08X} ===");
+        dump_trace_ring();
     }
 }
 

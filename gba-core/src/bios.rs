@@ -61,6 +61,13 @@ pub fn handle_swi(cpu: &mut Cpu, bus: &mut Bus, comment: u8) -> bool {
         0x15 => swi_rl_uncomp_vram(cpu, bus),
         0x1D => swi_sound_driver_vsync(bus),
         _ => {
+            if std::env::var("UNKNOWN_SWI_TRACE").is_ok() {
+                let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "[UNKSWI] 0x{:02X} pc=0x{:08X} thumb={} cyc={}",
+                    comment, bus.last_pc, cpu.cpsr.thumb(), cyc
+                );
+            }
             log::warn!("Unhandled SWI 0x{:02X}", comment);
             return false;
         }
@@ -180,33 +187,14 @@ fn swi_intr_wait(cpu: &mut Cpu, bus: &mut Bus) {
     let irq_flags = cpu.regs[1] as u16;
 
     if discard_old {
-        // Real BIOS clears the requested bits in the BIOS_IF mirror so
-        // we wait for a FRESH IRQ, not a pre-existing pending one.
         let current = bus.read16(0x0300_7FF8);
         bus.write16(0x0300_7FF8, current & !irq_flags);
     }
 
-    // Real BIOS forcefully sets IME=1 here (per GBATEK). Without it the
-    // wait can hang forever if the caller forgot.
-    bus.interrupt.ime = true;
-
-    if std::env::var("INTRWAIT_TRACE").is_ok() {
-        let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
-        eprintln!(
-            "[INTRWAIT] mask=0x{:04X} ie=0x{:04X} ir=0x{:04X} ime={} dispstat=0x{:04X} cyc={}",
-            irq_flags, bus.interrupt.ie, bus.interrupt.ir, bus.interrupt.ime,
-            bus.io.dispstat, cyc
-        );
-    }
-
-    // Record the wait mask so the step loop knows to re-halt after each
-    // IRQ delivery until a matching bit shows up in 0x03007FF8 (updated
-    // by handle_interrupt). Without this, ANY IRQ — e.g. HBlank — would
-    // wake the CPU and the SWI would return prematurely, letting the
-    // game loop iterate ~Nx per frame instead of once per VBlank. This
-    // breaks FE7 (the M4A mixer overruns its IWRAM channel state table
-    // and corrupts the IRQ handler itself; see debug doc).
-    cpu.intrwait_mask = irq_flags;
+    // For HLE, we just halt the CPU. The interrupt handler will resume it
+    // when the requested IRQ fires. (Note: this is not 100% spec — real
+    // BIOS loops, re-halting if a non-matching IRQ wakes it. See FE7
+    // debug doc for an attempt to implement this correctly.)
     cpu.halted = true;
 }
 

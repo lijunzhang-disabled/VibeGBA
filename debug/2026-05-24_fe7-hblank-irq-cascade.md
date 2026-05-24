@@ -617,3 +617,61 @@ HBlank IRQs entirely).
 
 3. Check whether FE7's user IRQ handler updates BIOS_IF in a way we
    missed — disassemble all paths after the ACK at IWRAM 0x03003A20.
+
+## Update 2026-05-25 part 8: the SWI 0x05 fix was a dead end
+
+Implemented the IntrWait HLE fix per part 7. Confirmed it's correct
+according to GBATEK spec (BIOS_IF mirror, IME=1 forcing, re-halt loop),
+and Pokemon Emerald continues to work. But:
+
+**FE7 only calls SWI 0x05 three times during init, then never again.**
+The main game loop at ROM `0x08000AEE` does:
+```
+loop:
+  BL audio_wrapper     ; → audio_engine_main → channel iterator → mixer
+  BL other_call        ; (0x08002CF4)
+  B loop
+```
+`other_call` does not invoke SWI 0x02/0x05 either. So the main loop runs
+without HALTing, calling audio_engine_main as fast as the CPU can iterate.
+The SWI 0x05 fix only affects init, not the runtime cascade.
+
+Verified with trace-ring escape detection (INSTR_TRACE_RING=1, tightened
+pc_in_valid_code to reject VRAM mirrors): the CPU ends up at PC=0xFFFFFFFC
+after SUBS PC, LR, #4 pops LR=0 from a corrupted IRQ-stack frame. The
+trace tail shows the IRQ-handler-nested-in-IRQ-handler cascade pattern
+we already identified — exactly the same root mechanism (M4A mixer
+buffer overflow → IRQ handler self-corruption) as before.
+
+Reverted SWI 0x04/0x05 changes since they don't help. Kept:
+* Tightened `pc_in_valid_code` (rejects VRAM, exclusive of 0x06).
+* Auto-dump of trace ring on freeze (eprintln directly from push_trace
+  rather than waiting for frontend's frame-loop check).
+* `GLOBAL_CYCLES` atomic (used by other probes).
+
+### Where to pick up
+
+The real root cause is that FE7's main loop runs unbounded per frame
+because it doesn't use any HALT mechanism. To fix the cascade without
+the `DISABLE_HBLANK_IRQ=1` workaround, we need one of:
+
+1. **Find how `other_call` (0x08002CF4) waits for VBlank**. Disassemble
+   it. If it busy-polls DISPSTAT bit 0 (VBlank flag), then the bug is
+   that the loop "succeeds" too quickly — maybe our DISPSTAT bit 0 stays
+   set longer than real hardware, or the loop has additional gates we're
+   missing.
+
+2. **Possible HBlank-counter throttle in the user IRQ handler**. The
+   HBlank subhandler at ROM `0x080BB354` increments a scanline counter
+   (R4 = 0..159 cyclic). FE7 may use this counter as a "VBlank gate" —
+   e.g., the main loop polls a state variable that the HBlank handler
+   sets at line 0 or 160. If our HBlank handler triggers wrap differently
+   than real hardware, the gate fires more often.
+
+3. **DMA1 sound underrun**. FE7 may rely on a "FIFO underrun → reset
+   mixer state" cycle that we don't model. If real FE7 detects buffer
+   high-water and stops calling audio_main, we don't.
+
+The workaround `DISABLE_HBLANK_IRQ=1` boots FE7 by avoiding the cascade
+entirely. To preserve correct HBlank behavior for other games, that's
+the production workaround until the cascade itself is properly fixed.
