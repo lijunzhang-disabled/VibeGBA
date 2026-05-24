@@ -255,13 +255,20 @@ impl Cpu {
             self.refill_pipeline(bus);
         }
 
+        // Clear any wait-state cycles accumulated by the IRQ-entry or
+        // pipeline-refill memory reads above (they're conceptually part of
+        // this step). All reads/writes from now until the end of step()
+        // will be summed into bus.mem_access_cycles. We harvest below.
+        let prior_mem_cycles = bus.take_mem_cycles();
         let cycles = if self.cpsr.thumb() {
             self.step_thumb(bus)
         } else {
             self.step_arm(bus)
         };
-        bus.tick_backup(cycles);
-        cycles
+        let mem_cycles = bus.take_mem_cycles();
+        let total = cycles + prior_mem_cycles + mem_cycles;
+        bus.tick_backup(total);
+        total
     }
 
     fn step_arm(&mut self, bus: &mut Bus) -> u32 {

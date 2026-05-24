@@ -89,6 +89,21 @@ pub struct Bus {
     /// Used by MEM_WATCH and similar diagnostics. Not authoritative for
     /// emulation correctness; debug-only.
     pub last_pc: u32,
+    /// Wait-state cycle accumulator. Each memory access adds the extra
+    /// cycles (above the 1-cycle baseline already counted by instructions)
+    /// for that region/width to this counter. CPU step harvests + resets
+    /// after each instruction.
+    ///
+    /// "Extra cycles" semantics:
+    ///   * BIOS/IWRAM/I/O/OAM: 0 extra (1-cycle access, 32-bit bus).
+    ///   * EWRAM: 2 extra for 8/16-bit (3 total), 5 extra for 32-bit
+    ///     (6 total = two 16-bit accesses on a 16-bit bus).
+    ///   * Palette/VRAM: 0 extra for 8/16-bit, 1 extra for 32-bit
+    ///     (16-bit bus, but each half is 1-cycle).
+    ///   * ROM (0x08..0x0D): driven by WAITCNT. WS0/WS1/WS2 wait state
+    ///     pairs encode (N, S) wait cycles added on top of 1 cycle.
+    #[serde(skip)]
+    pub mem_access_cycles: u32,
 }
 
 impl Bus {
@@ -131,12 +146,88 @@ impl Bus {
             has_bios,
             halt_requested: false,
             last_pc: 0,
+            mem_access_cycles: 0,
         }
+    }
+
+    /// Decode WAITCNT to (N_wait, S_wait) for a given waitstate region.
+    /// `ws` is 0/1/2 corresponding to WS0 (0x08-0x09), WS1 (0x0A-0x0B), WS2 (0x0C-0x0D).
+    /// Returns extra cycles to ADD to the 1-cycle baseline.
+    #[inline]
+    fn rom_waits(&self, ws: u32) -> (u32, u32) {
+        let w = self.io.waitcnt as u32;
+        // N: 2 bits → indices 0,1,2,3 → values 4,3,2,8
+        // S: 1 bit  → 0,1 → values varies by WS
+        let n_table: [u32; 4] = [4, 3, 2, 8];
+        match ws {
+            0 => {
+                let n = n_table[((w >> 2) & 0x3) as usize];
+                let s = if (w >> 4) & 1 != 0 { 1 } else { 2 };
+                (n, s)
+            }
+            1 => {
+                let n = n_table[((w >> 5) & 0x3) as usize];
+                let s = if (w >> 7) & 1 != 0 { 1 } else { 4 };
+                (n, s)
+            }
+            2 => {
+                let n = n_table[((w >> 8) & 0x3) as usize];
+                let s = if (w >> 10) & 1 != 0 { 1 } else { 8 };
+                (n, s)
+            }
+            _ => (4, 2),
+        }
+    }
+
+    /// Add the extra cycles for a memory access at addr.
+    /// `width_bytes` is 1, 2, or 4. `sequential` is whether this access
+    /// is sequential with the previous one (used for ROM waitstates only).
+    #[inline]
+    pub fn add_mem_cycles(&mut self, addr: u32, width_bytes: u32, sequential: bool) {
+        let extra = match addr >> 24 {
+            // 32-bit bus, 1-cycle access: BIOS, IWRAM, I/O, OAM. No extra.
+            0x00 | 0x03 | 0x04 | 0x07 => 0,
+            // EWRAM: 16-bit bus, 3-cycle access. Extra = 2 per halfword.
+            // For 32-bit, it's two 16-bit accesses = 6 total → 5 extra.
+            0x02 => if width_bytes == 4 { 5 } else { 2 },
+            // Palette / VRAM: 16-bit bus, 1-cycle each half.
+            // 32-bit = 2 cycles total → 1 extra.
+            0x05 | 0x06 => if width_bytes == 4 { 1 } else { 0 },
+            // GamePak ROM: WAITCNT-controlled.
+            // 0x08-0x09 → WS0, 0x0A-0x0B → WS1, 0x0C-0x0D → WS2.
+            0x08..=0x0D => {
+                let ws = ((addr >> 24) - 0x08) / 2;
+                let (n_wait, s_wait) = self.rom_waits(ws);
+                let single_wait = if sequential { s_wait } else { n_wait };
+                if width_bytes == 4 {
+                    // 32-bit access on 16-bit ROM bus = 1 non-seq + 1 seq half.
+                    single_wait + s_wait
+                } else {
+                    single_wait
+                }
+            }
+            // GamePak SRAM / unmapped — 0 extra (rare for code/data).
+            _ => 0,
+        };
+        self.mem_access_cycles = self.mem_access_cycles.saturating_add(extra);
+    }
+
+    /// Take and reset the accumulated memory-access cycles. Called by the
+    /// CPU step loop after each instruction executes.
+    #[inline]
+    pub fn take_mem_cycles(&mut self) -> u32 {
+        std::mem::replace(&mut self.mem_access_cycles, 0)
     }
 
     // ─── 8-bit reads ──────────────────────────────────────────────
 
     pub fn read8(&mut self, addr: u32) -> u8 {
+        // For now, treat every CPU memory access as non-sequential
+        // (conservative — slightly overestimates ROM waits compared to
+        // perfect S-vs-N tracking, but produces a stable, real-hardware-
+        // like timing baseline). When prefetch and pipeline sequentiality
+        // tracking get implemented, this can be refined.
+        self.add_mem_cycles(addr, 1, false);
         let val = match addr >> 24 {
             0x00 => self.read_bios(addr),
             0x02 => self.ewram[(addr & 0x3FFFF) as usize],
@@ -157,6 +248,7 @@ impl Bus {
 
     pub fn read16(&mut self, addr: u32) -> u16 {
         let addr = addr & !1; // Force halfword alignment
+        self.add_mem_cycles(addr, 2, false);
         let val = match addr >> 24 {
             0x00 => {
                 let lo = self.read_bios(addr) as u16;
@@ -198,6 +290,7 @@ impl Bus {
 
     pub fn read32(&mut self, addr: u32) -> u32 {
         let addr = addr & !3; // Force word alignment
+        self.add_mem_cycles(addr, 4, false);
         let val = match addr >> 24 {
             0x02 => {
                 let base = (addr & 0x3FFFF) as usize;
@@ -270,6 +363,7 @@ impl Bus {
     // ─── 8-bit writes ─────────────────────────────────────────────
 
     pub fn write8(&mut self, addr: u32, val: u8) {
+        self.add_mem_cycles(addr, 1, false);
         let (mw, lo, hi) = mem_watch_range();
         if mw && addr >= lo && addr < hi {
             let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
@@ -328,6 +422,7 @@ impl Bus {
     // ─── 16-bit writes ────────────────────────────────────────────
 
     pub fn write16(&mut self, addr: u32, val: u16) {
+        self.add_mem_cycles(addr, 2, false);
         let (mw, lo, hi) = mem_watch_range();
         if mw && addr >= lo && addr < hi {
             let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
@@ -383,6 +478,7 @@ impl Bus {
     // ─── 32-bit writes ────────────────────────────────────────────
 
     pub fn write32(&mut self, addr: u32, val: u32) {
+        self.add_mem_cycles(addr, 4, false);
         let (mw, lo, hi) = mem_watch_range();
         if mw && addr >= lo && addr < hi {
             let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
