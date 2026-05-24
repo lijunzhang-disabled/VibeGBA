@@ -534,3 +534,86 @@ overshoot perfectly. Likely scenarios:
 2. The writer's PC will likely point at an IRQ handler / VBlank service.
    Static-disassemble it and compare what triggers it on our emulator
    vs the spec.
+
+## Update 2026-05-25 part 7: HLE SWI 0x04/0x05 fix — partial; still WIP
+
+### What was missing
+
+Our HLE BIOS handled SWI 0x04 (IntrWait) and SWI 0x05 (VBlankIntrWait)
+incorrectly: they just set `cpu.halted = true` and returned, letting the
+generic halt-wake on **any** IRQ clear `halted`. So with HBlank IRQ
+enabled, SWI 0x05 would return on the first HBlank — completely defeating
+its purpose.
+
+This was the proximate cause of FE7's audio engine running 8.7×/frame
+instead of 1×/frame, leading to the M4A channel-state-table overflow.
+
+### The fix (in tree)
+
+1. **handle_interrupt**: OR the pending `IE & IF` bits into the
+   BIOS_IF mirror at IWRAM `0x03007FF8` before delivering the IRQ.
+   Per GBATEK, this is what real BIOS does, so user IRQ handlers
+   (which typically don't update BIOS_IF) work with SWI 0x04/0x05.
+2. **SWI 0x04/0x05 HLE**: store `irq_flags` in `cpu.intrwait_mask`,
+   force `IME=1` (per GBATEK), then halt.
+3. **CPU step**: at the start of each step (in non-IRQ, non-Supervisor
+   mode), if `intrwait_mask != 0` and the BIOS_IF mirror has a matching
+   bit, clear it and exit the wait. Otherwise re-halt. This emulates
+   the BIOS's `loop { HALT; if BIOS_IF & mask: return; }` semantics.
+
+### Current state
+
+* Pokemon Emerald: still boots and runs (regression-free).
+* FE7: progresses past 3 SWI 0x05 calls successfully (verified via
+  `INTRWAIT_TRACE=1` — see init phase with `ie=0x2001..0x2003`,
+  `dispstat=0x0009..0x0018`). After the third SWI 0x05, the game does
+  NOT call SWI 0x05 again — the main loop uses a different mechanism
+  to wait for VBlank, so the SWI 0x05 fix doesn't gate the cascade.
+* User reports the screen stays black + sustained "beee" audio. The
+  SWI trace shows **522 SWI 0xFF calls** (invalid SWI = garbage memory
+  execution) over ~30 seconds, indicating PC corruption somewhere.
+* Bisection (via `INTRWAIT_DISABLE` / `BIOS_IF_DISABLE` env vars,
+  since removed): only-BIOS_IF behaves identically to the original
+  (boot anim → cascade). Only-intrwait hangs immediately because
+  BIOS_IF never gets updated. So both halves are needed for the SWI
+  0x05 path to work — but together they introduce the PC-corruption
+  symptom whose cause is not yet identified.
+
+### Bug remaining to find
+
+PC corruption (522 SWI 0xFF in a 30-second run) after the fix is the
+mystery. Hypotheses to investigate:
+
+1. **IRQ-return PC computed wrong** when the IRQ is delivered while
+   `cpu.halted` was just-set by our intrwait check. handle_interrupt's
+   `return_addr = self.regs[15] (THUMB) or self.regs[15] - 4 (ARM)`
+   could be one off if pipeline_flushed state isn't right.
+
+2. **Mode-transition handling**: SUBS PC, LR, #4 from the BIOS IRQ
+   epilogue restores CPSR from SPSR and sets PC. If our implementation
+   doesn't fully restore the saved CPSR (mode, T-bit, IRQ flag), the
+   return could land in wrong mode → mis-decoded instructions.
+
+3. **FE7's user IRQ handler also writes BIOS_IF**, conflicting with
+   our handle_interrupt write. Static disassembly of FE7's handler at
+   IWRAM 0x03003950 didn't find a BIOS_IF write, but it might be
+   indirect (via a function call).
+
+### Workaround unchanged
+
+`DISABLE_HBLANK_IRQ=1` still boots FE7 (avoids the cascade by skipping
+HBlank IRQs entirely).
+
+### Where to pick up
+
+1. Add a probe at the SUBS PC, LR, #4 instruction (BIOS 0x2C) that
+   logs the saved CPSR, LR, the computed return PC, and the popped
+   register values. Run for ~1 second and check whether any return
+   lands in invalid memory.
+
+2. Add a "first invalid PC" probe that triggers TRACE_FREEZE_PC on the
+   first PC outside ROM/IWRAM/EWRAM. The trace ring will show the
+   instructions leading to the escape.
+
+3. Check whether FE7's user IRQ handler updates BIOS_IF in a way we
+   missed — disassemble all paths after the ACK at IWRAM 0x03003A20.

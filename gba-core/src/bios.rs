@@ -180,25 +180,40 @@ fn swi_intr_wait(cpu: &mut Cpu, bus: &mut Bus) {
     let irq_flags = cpu.regs[1] as u16;
 
     if discard_old {
-        // Clear the requested flags in the BIOS IRQ flags mirror at 0x03007FF8
+        // Real BIOS clears the requested bits in the BIOS_IF mirror so
+        // we wait for a FRESH IRQ, not a pre-existing pending one.
         let current = bus.read16(0x0300_7FF8);
         bus.write16(0x0300_7FF8, current & !irq_flags);
     }
 
-    // Store what we're waiting for — the main loop will check this
-    // For HLE, we just halt the CPU. The interrupt handler will resume it
-    // when the requested IRQ fires.
-    cpu.halted = true;
+    // Real BIOS forcefully sets IME=1 here (per GBATEK). Without it the
+    // wait can hang forever if the caller forgot.
+    bus.interrupt.ime = true;
 
-    // Store the wait flags for the IRQ handler to check
-    // We use R1 to remember what we're waiting for
-    // The real BIOS loops checking 0x03007FF8 & R1
+    if std::env::var("INTRWAIT_TRACE").is_ok() {
+        let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[INTRWAIT] mask=0x{:04X} ie=0x{:04X} ir=0x{:04X} ime={} dispstat=0x{:04X} cyc={}",
+            irq_flags, bus.interrupt.ie, bus.interrupt.ir, bus.interrupt.ime,
+            bus.io.dispstat, cyc
+        );
+    }
+
+    // Record the wait mask so the step loop knows to re-halt after each
+    // IRQ delivery until a matching bit shows up in 0x03007FF8 (updated
+    // by handle_interrupt). Without this, ANY IRQ — e.g. HBlank — would
+    // wake the CPU and the SWI would return prematurely, letting the
+    // game loop iterate ~Nx per frame instead of once per VBlank. This
+    // breaks FE7 (the M4A mixer overruns its IWRAM channel state table
+    // and corrupts the IRQ handler itself; see debug doc).
+    cpu.intrwait_mask = irq_flags;
+    cpu.halted = true;
 }
 
 // ─── SWI 0x05: VBlankIntrWait ────────────────────────────────────
 
 fn swi_vblank_intr_wait(cpu: &mut Cpu, bus: &mut Bus) {
-    // Equivalent to IntrWait(1, 1) — wait for VBlank
+    // Equivalent to IntrWait(1, 1) — discard old, wait for VBlank.
     cpu.regs[0] = 1;
     cpu.regs[1] = 1; // VBlank IRQ flag
     swi_intr_wait(cpu, bus);
