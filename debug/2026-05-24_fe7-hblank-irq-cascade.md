@@ -336,3 +336,60 @@ Tools added this round:
    (corrupted state lasting across frames). If healthy frames have
    ~24 batches/frame, the cascade frame is uniquely abnormal and we
    need to find what changes.
+
+## Update 2026-05-24 part 4: HBlank → mixer chain is INDIRECT
+
+Static disassembly of the HBlank subhandler at ROM `0x080BB354` shows
+it does per-line BG/palette effects via a scanline counter (R4 = 0..159
+cyclic, wrapped at 160 = `VISIBLE_LINES`). It DOES NOT directly call
+the mixer.
+
+The mixer's caller chain is:
+
+* Mixer at IWRAM `0x030031AC` is invoked via a callback table at IWRAM
+  `0x03002920` (which stores `0x030031AC` as the mixer's function pointer).
+* A thunk at ROM `0x080043A8..0x080043AC` loads that pointer and BLs to
+  the THUMB→ARM dispatcher at `0x080BFC5C` (a `BX R4` table). The dispatcher
+  swaps to ARM mode and invokes the mixer.
+* The thunk is invoked from FE7's audio engine main loop (TBD — not yet
+  located).
+
+So the HBlank → mixer link is INDIRECT. Most plausible mechanism:
+
+> With HBlank IRQ enabled, the CPU wakes ~228 times per frame (instead
+> of just at VBlank if disabled). Each wakeup gives user code a slice
+> of CPU time before halt; cumulatively the audio engine main loop
+> runs many more times per frame → calls mixer more times → state
+> table at 0x2930 overflows.
+
+This is consistent with `DISABLE_HBLANK_IRQ=1` fixing the boot.
+
+Real FE7 must have audio-engine throttle logic (e.g., "if mixer was
+already called this frame, skip" or "if buffer >= N entries, skip")
+that prevents the per-wake-up mixer invocations from accumulating.
+
+### Where to pick up next (carry-forward)
+
+1. **Find the audio engine main loop**: search ROM for BL references
+   to the thunk at `0x080043A8`. Likely a thumb instruction with offset
+   computing to 0x80043A8.
+
+2. **Static-disassemble the loop**: identify what counter / state / IRQ-
+   correlated variable it consults before calling the mixer thunk. Most
+   likely candidates:
+   - Frame counter (incremented at VBlank)
+   - Sound buffer write position vs read position (DMA1 SAD)
+   - A `samples_remaining_this_frame` counter
+
+3. **Verify our state matches real GBA at that decision point**: most
+   likely our scanline counter at the literal pool target of `0x080BB354`
+   (i.e., wherever R4 is stored) advances differently. The wrap at 160
+   suggests it's keyed to visible-vs-vblank lines; if our HBlank fires
+   on VBlank lines (160..227) and real GBA only fires HBlank on visible
+   lines, that'd give us ~68 extra wakeups per frame — close to the
+   factor we observe.
+
+4. **Sanity probe**: count HBlank IRQ entries split by `vc < 160` vs
+   `vc >= 160` over a frame. If we deliver HBlank IRQs during VBlank
+   that real GBA doesn't, fixing that gate should fix FE7 without
+   requiring `DISABLE_HBLANK_IRQ=1`.
