@@ -320,6 +320,28 @@ impl Cpu {
                 self.regs[0], self.regs[1], self.regs[2], self.regs[3],
                 self.regs[13], self.regs[14]);
         }
+
+        // FE7 audio engine main probe: log every entry to 0x0801529C
+        // (audio_engine_main) so we can count per-frame invocations.
+        // Also dumps the first 32 bytes of the channel array at 0x0202A48C
+        // (= 2 candidate channel-list head pointers + adjacent state).
+        if fe7_probe_enabled() {
+            let pc = self.regs[15].wrapping_sub(4);
+            if pc == 0x0801529C {
+                let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+                let vcount = bus.io.vcount;
+                let lr = self.regs[14];
+                // Dump first 32 bytes of channel array at 0x0202A48C
+                let mut chan_dump = String::new();
+                for off in (0..32).step_by(4) {
+                    let v = bus.peek32(0x0202A48C + off);
+                    chan_dump.push_str(&format!(" {v:08X}"));
+                }
+                eprintln!(
+                    "[AUDIO_MAIN] cyc={cyc} vc={vcount} lr=0x{lr:08X} chan_array=[{chan_dump} ]"
+                );
+            }
+        }
         let cycles = self.execute_thumb(bus, opcode);
 
         if !self.pipeline_flushed {

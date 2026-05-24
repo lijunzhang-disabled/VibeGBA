@@ -455,23 +455,7 @@ Real FE7 must have:
 
 ### Where to pick up next next
 
-1. **Find audio engine main's caller**: it's invoked via function-pointer
-   table. The 9 ROM occurrences of `0x0801529D` are in tables at
-   `0x08012718`, `0x08012B2C`, `0x0801B974`, `0x0802E0DC/178/204/304`,
-   `0x08055800`, `0x0806B9B0`. Some are FE7's per-mode "tick list" tables
-   (one per game-state). Find which tick list is currently active and
-   how often it gets iterated. If it iterates more than once per frame
-   in our emulator, that's the bug.
-
-2. **Count `0x0801529C` entries per frame**: add a one-shot probe that
-   counts BL into 0x0801529C per VBlank period. If our count > 1, our
-   tick-driver runs too often.
-
-3. **Verify channel list contents**: dump `[0x0202A48C]..[0x0202A48C + 16]`
-   (the channel array for R0=0) and follow the linked list. Count
-   active channels. Compare to known FE7 reference (mp2k engine spec
-   says 8 channels max for music). If we somehow have more active
-   channels than real FE7, that's the bug.
+(Investigated below — see part 6.)
 
 Tools added this round:
 * No new env vars. Used existing `INSTR_TRACE_RING=1` + `TRACE_FREEZE_PC=0xADDR`
@@ -488,3 +472,65 @@ ROM disassembly notes:
 * HBlank subhandler pointer slot: `0x03002924` (RAM, holds 0x080BB355)
 * Mixer write-pointer: `0x03002F34` (RAM, advances 0x2930→0x2F30 per frame)
 * Channel array base: `0x0202A48C` (EWRAM)
+
+## Update 2026-05-24 part 6: caller is a gated wrapper, gate at 0x02024C70
+
+Added probe at `PC=0x0801529C` (audio_engine_main entry) under
+`FE7_PROBE=1`. Results across a 30M-cycle run (~107 frames):
+
+* **934 audio_engine_main fires** ≈ **8.7 per frame**. Real FE7 should be
+  ~1 per frame.
+* **Channel count is fine**: only 2 active channels (heads at
+  `0x0202A49C` and `0x0202A4AC`).
+* **Single caller**: LR=`0x080019E9` everywhere. So one site is
+  responsible for all the over-firing.
+* **Period between consecutive fires**:
+  - 2465-2466 cycles (~2 scanlines, by far the most common)
+  - 32091-32094 cycles (~26 scanlines)
+  - 34525-34530 cycles (~28 scanlines)
+
+The 2465-cycle period is **exactly 2×HBlank cycle period (2×1232)**.
+This is the strongest signal yet: with HBlank IRQ enabled, FE7 wakes
+the CPU every line; the caller at 0x080019E4 runs and finds the gate
+flag set; audio_main is invoked.
+
+### Caller disassembly at ROM 0x080019D4
+
+```
+0x19D4: 0x90b5      PUSH {R4, R7}
+0x19D6: 0x6f46      MOV R7, SP
+0x19D8: 0x4805      LDR R0, [PC, #20]   ; R0 = 0x02024C70 (literal)
+0x19DA: 0x6801      LDR R1, [R0]        ; R1 = [0x02024C70]  ← gate
+0x19DC: 0x2900      CMP R1, #0
+0x19DE: 0xD003      BEQ +6 → 0x19E8     ; skip if gate clear
+0x19E0: 0x4803      LDR R0, [PC, #12]   ; R0 = 0x02024C70 (same literal)
+0x19E2: 0x6804      LDR R4, [R0]        ; R4 = [0x02024C70]  (audio_main arg)
+0x19E4: 0xBEF0/0xF93A  BL audio_engine_main
+0x19E8: POP/BX_LR
+```
+
+**The audio gate variable is at EWRAM `0x02024C70`.** When non-zero,
+audio_main runs with that value as its R0 argument. We need to find
+who writes this variable.
+
+Most likely candidates for the writer:
+* VBlank handler / interrupt service routine — increments per frame
+  signal that audio is due
+* M4A's timer-driven update path — should write once per audio frame
+
+If our emulator writes this variable too often, that explains the 8.7×
+overshoot perfectly. Likely scenarios:
+1. We deliver some IRQ (HBlank? Timer?) that writes the gate, but real
+   GBA gates the IRQ differently → we write too often.
+2. Our DMA1 FIFO underrun handling writes the gate (or a related state
+   variable) too often.
+
+### Where to pick up next
+
+1. Run with `MEM_WATCH=1 MEM_WATCH_LO=0x02024C70 MEM_WATCH_HI=0x02024C74`
+   for a few seconds. The log will show every write to the gate variable
+   with PC + cyc. Count writes per frame: expected 1, observed N.
+
+2. The writer's PC will likely point at an IRQ handler / VBlank service.
+   Static-disassemble it and compare what triggers it on our emulator
+   vs the spec.
