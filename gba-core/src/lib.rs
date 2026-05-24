@@ -18,6 +18,12 @@ pub mod scheduler;
 // can call dump_trace_ring() to print the last N instructions executed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Global cycle clock — updated by the step loop before each cpu.step().
+// Lets diagnostic probes inside the CPU sample wall-clock cycles without
+// having to thread the scheduler through. Zero cost when probes don't read.
+pub static GLOBAL_CYCLES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Default)]
 pub struct TraceEntry {
@@ -225,6 +231,7 @@ impl Gba {
                     }
                     break;
                 }
+                GLOBAL_CYCLES.store(self.scheduler.timestamp(), Ordering::Relaxed);
                 let cycles = self.cpu.step(&mut self.bus) as u64;
                 self.scheduler.add_cycles(cycles);
 

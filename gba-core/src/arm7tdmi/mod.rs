@@ -267,17 +267,34 @@ impl Cpu {
         }
         if fe7_probe_enabled() {
             let pc = self.regs[15].wrapping_sub(8);
-            if pc == 0x03003950 || pc == 0x03003A20 || pc == 0x03003A30 || pc == 0x03003A48 {
+            // Add finer-grained probes inside the handler prologue:
+            //   0x3958 = LDR R2, [R3]       — about to read REG_IE/IF
+            //   0x395C = MOV R1, R2 LSL #16 — R2 just loaded, captures actual read value
+            //   0x396C = AND R1, R2, R2 LSR #16 — computes R1 = IE&IF
+            //   0x3970 = ANDS R0, R1, #0x2000 — first dispatch test
+            //   0x3A20 = STRH R0, [R3, #2]  — ACK to REG_IF
+            if pc == 0x03003950 || pc == 0x03003958 || pc == 0x0300395C
+                || pc == 0x0300396C || pc == 0x03003970
+                || pc == 0x03003974 || pc == 0x03003978
+                || pc == 0x0300397C || pc == 0x03003980
+                || pc == 0x03003984
+                || pc == 0x03003988 || pc == 0x0300398C
+                || pc == 0x03003A18 || pc == 0x03003A1C
+                || pc == 0x03003A20 || pc == 0x03003A30
+                || pc == 0x03003A48 || pc == 0x03003A6C {
                 let ie = bus.interrupt.ie;
                 let ir = bus.interrupt.ir;
                 let dispstat = bus.io.dispstat;
                 let vcount = bus.io.vcount;
-                // At 0x3950 / 0x3A20 / 0x3A30 the CPU is in IRQ mode
-                // (handler hasn't switched modes yet), so regs[13] IS sp_irq.
                 let sp = self.regs[13];
+                let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+                let cpsr = self.cpsr.bits;
+                let opcode = self.pipeline[0];
+                let mem_opcode = bus.peek32(pc);
                 eprintln!(
-                    "[FE7] pc={pc:08X} ie=0x{ie:04X} if=0x{ir:04X} \
-                     dispstat=0x{dispstat:04X} vc={vcount} \
+                    "[FE7] pc={pc:08X} cyc={cyc} op=0x{opcode:08X} mem=0x{mem_opcode:08X} \
+                     ie=0x{ie:04X} if=0x{ir:04X} \
+                     dispstat=0x{dispstat:04X} vc={vcount} cpsr=0x{cpsr:08X} \
                      r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} sp=0x{:08X}",
                     self.regs[0], self.regs[1], self.regs[2], self.regs[3], sp
                 );

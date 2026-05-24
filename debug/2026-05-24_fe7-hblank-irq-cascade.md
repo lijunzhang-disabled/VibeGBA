@@ -63,11 +63,96 @@ All env-gated, no perf impact when unset:
 - `HBLANK_IRQ_TRACE=1` — logs every HBlank IRQ fire with time, vc, ir, ie. In `gba-core/src/lib.rs` HBlank event handler.
 - `DISABLE_HBLANK_IRQ=1` — short-circuits the HBlank IRQ fire path. The current workaround for booting FE7.
 
-## Where to pick up
+## Update 2026-05-24: cascade trigger is NOT a cycle-budget issue
 
-The path forward is to measure the actual cycle cost of one full depth-2 HBlank handler iteration in our emulator (entry-to-exit), compare to the real-hardware budget of < 1232 cycles, and find the discrepancy. Concrete next steps:
+A finer-grained probe (`FE7_PROBE=1` with bit-level breakpoints) traced the
+cascade trigger to a SPECIFIC instruction-level corruption — not a per-call
+timing overflow.
 
-1. Add an instruction-counter probe at HBlank-subhandler entry (PC=`0x080BB354`) and exit (the POP {…, PC} instructions in that function). Print delta cycles per call.
-2. Disassemble the full subhandler in `~/Documents/FireEmblem/FireEmblem7.gba` from `0x080BB354` to its terminal POP. Identify the hot path.
-3. Cycle-budget the hot path by hand using ARM7TDMI cycle rules; compare to what our `cycles` return values say.
-4. Likely fix is in `gba-core/src/arm7tdmi/thumb.rs` cycle returns. If LDR/STR-via-pool costs aren't tracking the 1S+1N+1I model correctly, that could be it.
+### Root mechanism
+
+At cyc=31335028..31335045 (between vc=99 HBlank handler exit and vc=100
+HBlank handler entry), FE7's own code at IWRAM `0x03003200` writes three
+halfwords:
+
+```
+[WR16] 0x03003984 = 0x000E  pc=0x03003200 cyc=31335028
+[WR16] 0x03003986 = 0x0096  pc=0x03003220 cyc=31335039
+[WR16] 0x03003988 = 0x3985  pc=0x0300322C cyc=31335045
+```
+
+These overwrite the IRQ handler's dispatch instructions:
+- IWRAM `0x03003984` was `0xE2822004` (`ADD R2, R2, #4`) → becomes `0x0096000E`
+- IWRAM `0x03003988` was `0xE2110002` (`ANDS R0, R1, #2`, the bit-1 HBlank
+  match test) → becomes `0xE2113985` (`ANDS R3, R1, #0x214000`)
+
+The corrupted bit-1 test writes to R3 instead of R0, so:
+1. The HBlank match is never detected (R0 stays 0, Z flag becomes 1 since
+   R1 & 0x214000 = 0)
+2. The handler walks past all bit tests, eventually ACKing with R0=0 at
+   `0x03003A20`, which writes nothing to REG_IF
+3. After MSR re-enables IRQs, IF.bit1 is still set → HBlank IRQ re-delivers
+   immediately → depth-1 nested entry
+4. Same corruption affects every nested invocation → unbounded cascade
+
+The `0x03003984` corruption ALSO breaks the previous ADD: `0x0096000E`
+decodes as `ADDEQS R0, R6, R14` (cond=EQ, opcode=ADD, S=1, Rn=R6, Rd=R0).
+Since Z=1 from the prior bit-0 ANDS and R14 (LR_irq) = 0x28, R0 becomes
+0x28 + R6 — observable in the probe log.
+
+### What we DON'T yet understand
+
+FE7 is INTENTIONALLY corrupting its own IRQ handler region. On real GBA
+this presumably works — three possible explanations:
+
+a. **HBlank IRQ is disabled by FE7 around the self-mod**, e.g. via clearing
+   DISPSTAT bit 4, IE bit 1, or IME=0. Our probe shows DISPSTAT=0x001B
+   (HBlank IRQ enabled) right through the cascade window, so if FE7 does
+   disable, we're missing some write. Need to add MEM_WATCH on REG_IME
+   (`0x04000208`), REG_IE (`0x04000200`), and DISPSTAT (`0x04000004`)
+   across the cascade window.
+
+b. **The IRQ vector is not actually 0x03003950 on real GBA at this point.**
+   FE7 might relocate the handler entry to a different address whose code
+   doesn't pass through 0x3984+. Our [0x03007FFC] reads as 0x03003950
+   throughout. Either FE7 doesn't relocate (so this isn't it) or our IWRAM
+   mirror handling for the vector at 0x03FFFFFC is broken.
+
+c. **The 0x3984+ region is the SOUND MIXER buffer in FE7's design**, and
+   the IRQ handler is only ~13 instructions long (ending before 0x3984).
+   FE7 boots with a longer handler placed at 0x3950 then replaces it. We
+   verified the bytes at 0x3984+ are still the original LONG handler bytes
+   in healthy iter at vc=99, so this hypothesis requires FE7 to overwrite
+   the dispatch chain WITHOUT us seeing a clean rewrite first — possible
+   if FE7 writes piecewise.
+
+The writes from `0x03003200` look like an audio mixer inner loop (LDRH /
+ORR / AND / STRH with halfword shift-merge patterns) — consistent with
+M4A/MP2K sound engine writing to a sample buffer.
+
+### Tools added in this round
+
+* `FE7_PROBE=1` extended to log opcode + memory contents at each dispatch
+  PC. Reveals when the in-memory bytes diverge from what we expect.
+* `GLOBAL_CYCLES` atomic in `gba-core/src/lib.rs`, updated before each
+  `cpu.step()`. Lets MEM_WATCH and FE7_PROBE include cycle stamps without
+  threading the scheduler through every probe.
+* `MEM_WATCH` log lines now include `cyc=N` so we can correlate writes
+  with handler executions.
+* IWRAM dump key (`I`) — captures full IWRAM image to `/tmp/iwram-NNN.bin`
+  for offline disassembly of runtime-resident routines (e.g. the writer
+  at 0x3200).
+
+### Where to pick up next
+
+1. Run with MEM_WATCH on `0x04000200..0x0400020A` (REG_IE, REG_IF, REG_IME)
+   AND on `0x04000004` (DISPSTAT), with FE7_PROBE on, and grep around
+   cyc=31335028..31335045 to see if FE7 disables IRQs around the self-mod.
+2. If yes: figure out why our emulator doesn't honor it. Likely an IRQ
+   delivery timing bug (we deliver IRQs even when something should gate
+   them).
+3. If no: the IRQ handler's design must NOT extend past 0x3984 in real
+   FE7. Investigate whether the handler at 0x3950 is supposed to be
+   replaced or relocated.
+4. Disassemble the function at IWRAM `0x03003200` to understand its
+   purpose. Bytes are in `/tmp/iwram-001.bin` at offset 0x3200.

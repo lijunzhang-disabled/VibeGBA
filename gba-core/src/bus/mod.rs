@@ -272,7 +272,8 @@ impl Bus {
     pub fn write8(&mut self, addr: u32, val: u8) {
         let (mw, lo, hi) = mem_watch_range();
         if mw && addr >= lo && addr < hi {
-            eprintln!("[WR8 ] 0x{:08X} = 0x{:02X}  pc=0x{:08X}", addr, val, self.last_pc);
+            let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[WR8 ] 0x{:08X} = 0x{:02X}  pc=0x{:08X} cyc={}", addr, val, self.last_pc, cyc);
         }
         match addr >> 24 {
             0x02 => self.ewram[(addr & 0x3FFFF) as usize] = val,
@@ -329,7 +330,8 @@ impl Bus {
     pub fn write16(&mut self, addr: u32, val: u16) {
         let (mw, lo, hi) = mem_watch_range();
         if mw && addr >= lo && addr < hi {
-            eprintln!("[WR16] 0x{:08X} = 0x{:04X}  pc=0x{:08X}", addr, val, self.last_pc);
+            let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[WR16] 0x{:08X} = 0x{:04X}  pc=0x{:08X} cyc={}", addr, val, self.last_pc, cyc);
         }
         let addr = addr & !1;
         let bytes = val.to_le_bytes();
@@ -383,7 +385,8 @@ impl Bus {
     pub fn write32(&mut self, addr: u32, val: u32) {
         let (mw, lo, hi) = mem_watch_range();
         if mw && addr >= lo && addr < hi {
-            eprintln!("[WR32] 0x{:08X} = 0x{:08X}  pc=0x{:08X}", addr, val, self.last_pc);
+            let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[WR32] 0x{:08X} = 0x{:08X}  pc=0x{:08X} cyc={}", addr, val, self.last_pc, cyc);
         }
         let addr = addr & !3;
         let bytes = val.to_le_bytes();
