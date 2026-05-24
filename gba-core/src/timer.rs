@@ -154,6 +154,19 @@ impl Timers {
                 if i == 1 {
                     result.timer1_overflow = true;
                 }
+                // TIMER_TRACE: log every overflow for T0/T1 (the audio-clock timers).
+                static TIMER_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let trace = *TIMER_TRACE.get_or_init(|| std::env::var("TIMER_TRACE").is_ok());
+                if trace && i < 2 {
+                    let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+                    let irq_en = self.timers[i].irq_enabled();
+                    let reload = self.timers[i].reload;
+                    let prescaler = self.timers[i].prescaler();
+                    eprintln!(
+                        "[TIMER{i}] overflow cyc={cyc} n={overflows} irq_en={irq_en} \
+                         reload=0x{reload:04X} prescaler={prescaler}"
+                    );
+                }
             }
         }
 

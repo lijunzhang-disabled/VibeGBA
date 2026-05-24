@@ -257,3 +257,82 @@ Tools added this round:
   stamped. Lives in `gba-core/src/interrupt.rs` and `bus/mod.rs`.
 * Mixer-entry probe: `FE7_PROBE=1` now also logs at PC=0x030031AC and
   the prologue PCs of the mixer function, recording R2/R4/R5/LR.
+
+## Update 2026-05-24 part 3: audio peripherals confirmed correct
+
+With `DMA_FIRE_TRACE=1 TIMER_TRACE=1 DMA_IRQ_TRACE=1`:
+
+* **Timer 0**: reload=0xFB1A, prescaler=1 → 1254 cycles/overflow =
+  **13380 Hz** in steady state. Matches M4A's 13379 Hz audio sample rate.
+  IRQ enable = false (timer drives Sound DMA via Special timing only,
+  no IRQ).
+* **DMA1**: fires every ~20060 cycles ≈ 16 timer overflows in steady
+  state. SAD cycles through `0x03004E80..0x03004F00` — a 128-byte ring
+  buffer. IRQ enable = false.
+* **DMA2**: same cadence as DMA1 (synchronized FIFO refills).
+* **DMA-IRQ**: **0 fires** across the entire run. No DMA completion
+  IRQs ever raised — falsifies hypothesis (a) from part 2.
+
+So the audio peripherals (Timer 0, DMA1, DMA2, FIFO_A, FIFO_B) are all
+running correctly. The cascade trigger is NOT a DMA/Timer accuracy
+bug — those run at the exactly right rate.
+
+### Layout discovery: TWO buffers in IWRAM
+
+* **0x03002930..0x03002F2F** (1536 bytes, 192 × 8-byte slots): the
+  buffer that the mixer at `0x030031AC` writes to. **This is the one
+  that overflows.** Each 8-byte slot looks like a channel state /
+  voice entry (`a0 00 00 00 <varying> 12 00 00`) — NOT raw audio.
+* **0x03004E80..0x03004F00** (128 bytes): the actual DMA1 audio output
+  ring buffer. Separate from above. Cycles continuously.
+
+So the mixer's "buffer overflow" isn't an audio-output overflow — it's
+an intermediate **channel / voice state table** overflow. The DMA1
+output buffer is healthy and being consumed by the DMA at the right
+rate.
+
+### Reframed problem
+
+The mixer at `0x030031AC` fills a 192-entry state table at `0x2930..0x2F2F`
+per frame. Our emulator runs the mixer ~33 batches × 8 entries = ~264
+entries per frame, OVERFLOWING the 192-entry table. Real FE7 must
+produce ≤192 entries/frame.
+
+The mixer is called from FE7's HBlank IRQ subhandler at ROM `0x080BB354`
+(verified via the dispatch table at IWRAM `0x2924`). `DISABLE_HBLANK_IRQ=1`
+removes the trigger → game boots.
+
+**The most-likely-correct hypothesis**: the HBlank subhandler should
+conditionally skip mixer batches based on some state (e.g., "has the
+state table already been processed by another routine in this frame?")
+that our emulator gets wrong. OR our HBlank subhandler runs more
+instructions than real GBA per call, allowing more mixer batches to
+fit in the IRQ-disabled window.
+
+Tools added this round:
+
+* `DMA_FIRE_TRACE=1` extended to include cycle stamp, irq_enable
+  status, SAD/DAD, and now covers DMA2 as well as DMA1. Lives in
+  `gba-core/src/bus/mod.rs`.
+* `TIMER_TRACE=1` env var — logs Timer 0 and Timer 1 overflows with
+  cyc, count, IRQ-enable, reload, prescaler. Lives in
+  `gba-core/src/timer.rs`.
+* `DMA_IRQ_TRACE=1` env var — logs every DMA-completion IRQ
+  request (DMA0..DMA3). Cycle-stamped. Lives in `gba-core/src/lib.rs`.
+
+### Where to pick up
+
+1. Disassemble FE7 ROM at `0x080BB354` (the HBlank subhandler) and
+   `0x080043A0` (the mixer caller) to find what gates the mixer call
+   rate. The gate is probably a counter or a buffer-position check.
+
+2. If the gate involves the DMA1 SAD (e.g., "skip mixer if SAD has
+   wrapped within the current frame"), that points at our DMA1 SAD
+   re-anchor logic at VBlank possibly resetting too early.
+
+3. Alternative: count mixer-batches-per-frame in a HEALTHY frame
+   (e.g., cyc≈12.9M) vs the CASCADE frame (cyc≈31.1M). If healthy
+   frames also have ~33 batches/frame, the bug is something else
+   (corrupted state lasting across frames). If healthy frames have
+   ~24 batches/frame, the cascade frame is uniquely abnormal and we
+   need to find what changes.

@@ -500,6 +500,12 @@ impl Gba {
                         3 => interrupt::Irq::Dma3,
                         _ => continue,
                     };
+                    static DMA_IRQ_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    let trace = *DMA_IRQ_TRACE.get_or_init(|| std::env::var("DMA_IRQ_TRACE").is_ok());
+                    if trace {
+                        let cyc = GLOBAL_CYCLES.load(Ordering::Relaxed);
+                        eprintln!("[DMA-IRQ] ch={ch_id} timing=FIFO cyc={cyc}");
+                    }
                     self.bus.interrupt.request_irq(irq_type);
                 }
             }
@@ -519,6 +525,12 @@ impl Gba {
                     3 => interrupt::Irq::Dma3,
                     _ => continue,
                 };
+                static DMA_IRQ_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let trace = *DMA_IRQ_TRACE.get_or_init(|| std::env::var("DMA_IRQ_TRACE").is_ok());
+                if trace {
+                    let cyc = GLOBAL_CYCLES.load(Ordering::Relaxed);
+                    eprintln!("[DMA-IRQ] ch={ch_id} timing={timing:?} cyc={cyc}");
+                }
                 self.bus.interrupt.request_irq(irq_type);
             }
         }

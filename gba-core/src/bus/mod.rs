@@ -475,17 +475,21 @@ impl Bus {
             return (0, false);
         }
         self.dma.channels[channel_id].run_count += 1;
-        if dma_fire_trace_enabled() && channel_id == 1 {
-            // Print stack-ish info: this fire happened, with FIFO count for context
+        if dma_fire_trace_enabled() && (channel_id == 1 || channel_id == 2) {
+            let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
             let fifo_count = self.apu.fifo_a.count;
             let fifo_b_count = self.apu.fifo_b.count;
             let refill_req_a = self.apu.fifo_a.refill_request_count;
             let refill_req_b = self.apu.fifo_b.refill_request_count;
-            let timing = self.dma.channels[1].timing();
+            let ch = &self.dma.channels[channel_id];
+            let timing = ch.timing();
+            let irq_en = ch.irq_enabled();
+            let sad = ch.internal_sad;
+            let dad = ch.dad;
             eprintln!(
-                "  run_dma(1) timing={:?} fifo_a_count={} fifo_b_count={} \
-                 refill_req_a={} refill_req_b={}",
-                timing, fifo_count, fifo_b_count, refill_req_a, refill_req_b
+                "[DMA{channel_id}] cyc={cyc} timing={timing:?} irq_en={irq_en} \
+                 sad=0x{sad:08X} dad=0x{dad:08X} \
+                 fa={fifo_count} fb={fifo_b_count} refill_a={refill_req_a} refill_b={refill_req_b}"
             );
         }
         let ch = &self.dma.channels[channel_id];
