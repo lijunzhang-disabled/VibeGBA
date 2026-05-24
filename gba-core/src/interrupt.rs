@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+fn irq_gate_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("IRQ_GATE_TRACE").is_ok())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Irq {
     VBlank = 0,
@@ -59,6 +65,10 @@ impl InterruptController {
 
     /// Write IE register.
     pub fn write_ie(&mut self, value: u16) {
+        if irq_gate_trace_enabled() {
+            let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[IRQ-GATE] write IE: 0x{:04X} -> 0x{:04X} cyc={}", self.ie, value, cyc);
+        }
         self.ie = value;
     }
 
@@ -69,6 +79,11 @@ impl InterruptController {
 
     /// Write IF register (acknowledge).
     pub fn write_if(&mut self, value: u16) {
+        if irq_gate_trace_enabled() {
+            let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[IRQ-GATE] write IF: 0x{:04X} -> 0x{:04X} (ack 0x{:04X}) cyc={}",
+                self.ir, self.ir & !value, value, cyc);
+        }
         self.acknowledge(value);
     }
 
@@ -79,6 +94,11 @@ impl InterruptController {
 
     /// Write IME register.
     pub fn write_ime(&mut self, value: u16) {
-        self.ime = value & 1 != 0;
+        let new = value & 1 != 0;
+        if irq_gate_trace_enabled() && new != self.ime {
+            let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[IRQ-GATE] write IME: {} -> {} cyc={}", self.ime, new, cyc);
+        }
+        self.ime = new;
     }
 }

@@ -143,16 +143,117 @@ M4A/MP2K sound engine writing to a sample buffer.
   for offline disassembly of runtime-resident routines (e.g. the writer
   at 0x3200).
 
+## Update 2026-05-24 part 2: the writer at 0x03003200 is the audio mixer
+
+Hypothesis (a) — "FE7 disables HBlank IRQ around the self-mod" — falsified
+by `IRQ_GATE_TRACE=1`. In the cascade window (cyc=31334000..31336000) only
+two IRQ-state writes happen, and both are normal handler ack/restore:
+
+```
+[IRQ-GATE] write IF: 0x0002 -> 0x0000 (ack 0x0002) cyc=31334075
+[IRQ-GATE] write IE: 0x2003 -> 0x2003 cyc=31334176
+```
+
+No IME toggle, no DISPSTAT bit-4 clear, no IE.bit1 clear. HBlank IRQ is
+fully enabled across the self-mod. So the mechanism is NOT IRQ-gating.
+
+### What the writes actually are
+
+The function at IWRAM `0x030031AC` is **FE7's M4A audio sample mixer**.
+ARM-mode, ~38 instructions, loops over R4 input samples. Per iteration:
+
+```
+LDRH R1, [R2]    ; read source halfword
+STRH R6, [R5,#0] ; write halfword 0 to dest
+STRH R6, [R5,#2] ; write halfword 2
+STRH R6, [R5,#4] ; write halfword 4
+ADD R2, R2, #6   ; advance source by 6 bytes
+ADD R5, R5, #8   ; advance dest by 8 bytes (3 halfwords + 2 alignment)
+```
+
+The destination is a write pointer stored at IWRAM `0x03002F34`. The
+function pre-computes the post-loop pointer (`R5 + R4*8`) and saves it
+back to `[0x03002F34]` BEFORE the loop runs, so subsequent calls pick
+up where the last one left off. The audio sample buffer lives at
+`0x03002930..0x03002F30` (192 samples × 8 bytes = 0x600 bytes).
+
+### The actual cascade trigger
+
+The buffer pointer storage at `0x03002F34` **overlaps with the buffer's
+own write region**. Specifically, the 193rd-sample iteration (when
+R5 = 0x03002F30) does `STRH R6, [R5, #4]` → writes sample data to
+`0x03002F34` → **corrupts the buffer pointer itself**. The next mixer
+call loads the corrupted pointer (which happens to land in the IRQ
+handler's address space) and writes audio data into the handler.
+
+Verified at cyc=31334913 in `/tmp/fe7_ptr.log`:
+
+```
+[WR32] 0x03002F34 = 0x03002F38  pc=0x030031D0 cyc=31334882   ; pre-compute (R5=0x2F30, R4=1)
+[WR16] 0x03002F34 = 0x3985      pc=0x0300322C cyc=31334913   ; SELF-CORRUPTION via STRH [R5,#4]
+[WR32] 0x03002F34 = 0x0300398D  pc=0x030031D0 cyc=31335014   ; next call: ptr now in IRQ handler
+```
+
+The next mixer call has R5 ≈ 0x03003984; its `STRH R6, [R5, #0/2/4]`
+writes audio sample bytes into the IRQ handler at `0x03003984..0x03003988`,
+corrupting `ADD R2, R2, #4` and `ANDS R0, R1, #2` (the bit-1 HBlank match).
+Cascade begins on the very next HBlank IRQ.
+
+### Why FE7 doesn't crash on real hardware
+
+The mixer's caller (at LR=0x080043A7 in ROM) calls the mixer in batches of
+~8 samples every ~6300 cycles (~21 kHz audio rate). Over a full GBA frame
+(280896 cycles) that's about 350 samples — far more than the 192-sample
+buffer holds. So **the buffer MUST wrap mid-frame on real FE7**, but in
+our run the only buffer-pointer reset we see is once per frame from ROM
+at `pc=0x08003310` (the M4A VBlank routine), with no intermediate wraps.
+
+Real FE7 must have a wrap mechanism we're missing. Candidates:
+
+a. **Sound DMA1 + Timer 0 cascade**: M4A typically uses DMA1 to stream
+   samples from the buffer to FIFO_A, clocked by Timer 0 overflow. When
+   DMA1 completes a buffer half, a DMA-complete IRQ fires the audio
+   engine's swap routine, which presumably resets the pointer. If our
+   DMA1-complete IRQ doesn't fire at the right time (or at all), the
+   swap routine never runs → no mid-frame wrap.
+
+b. **Some Timer IRQ we're delivering wrong**: if our timer overflow rate
+   differs from real GBA (slightly faster), the audio engine's state
+   machine could miss a phase transition that would normally wrap.
+
+c. **Our CPU instructions are undercounting cycles**: causing the emulator
+   to "fit more work per emulated frame" than real GBA. The mixer caller
+   gets more chances to run per frame → more batches → overflow.
+
+The fact that `DISABLE_HBLANK_IRQ=1` fixes the boot is consistent with
+all three: removing HBlank IRQs removes the mixer-trigger chain.
+
 ### Where to pick up next
 
-1. Run with MEM_WATCH on `0x04000200..0x0400020A` (REG_IE, REG_IF, REG_IME)
-   AND on `0x04000004` (DISPSTAT), with FE7_PROBE on, and grep around
-   cyc=31335028..31335045 to see if FE7 disables IRQs around the self-mod.
-2. If yes: figure out why our emulator doesn't honor it. Likely an IRQ
-   delivery timing bug (we deliver IRQs even when something should gate
-   them).
-3. If no: the IRQ handler's design must NOT extend past 0x3984 in real
-   FE7. Investigate whether the handler at 0x3950 is supposed to be
-   replaced or relocated.
-4. Disassemble the function at IWRAM `0x03003200` to understand its
-   purpose. Bytes are in `/tmp/iwram-001.bin` at offset 0x3200.
+1. Trace **Sound DMA1 activity around the cascade window**: with
+   `DMA_FIRE_TRACE=1` (already env-gated in `bus/mod.rs`), confirm DMA1
+   refill timing, FIFO state, and DMA-complete IRQ delivery for both
+   "healthy" frames (e.g., cyc≈12.9M) and the cascade frame
+   (cyc≈31.3M). If healthy frames have a DMA1-complete IRQ that fires
+   the M4A buffer swap and the cascade frame doesn't, that's the bug.
+
+2. Add **Timer 0 overflow trace** for the same window. M4A's sample
+   clock is Timer 0. If our overflow rate is off, mixer rate is off.
+
+3. Disassemble FE7 ROM at `0x080043A0` to find the **mixer caller's
+   wrap check** (if any). The caller might compare ptr against a limit
+   and reset to 0x03002930 if it overshoots — and we might be skipping
+   that path due to a register or memory state we get wrong.
+
+4. Sanity-check our `cycles` return values for the hot instructions in
+   the mixer (`STRH`, `LDRH`, `ADD imm`, `ORR reg`). If any are
+   undercounting by 1 cycle, accumulated drift over hundreds of
+   batches per frame could explain the extra-iteration overflow.
+
+Tools added this round:
+
+* `IRQ_GATE_TRACE=1` env var — logs every write to IE / IF / IME, and
+  every change to DISPSTAT bits 3/4/5 (the IRQ-enable bits). Cycle-
+  stamped. Lives in `gba-core/src/interrupt.rs` and `bus/mod.rs`.
+* Mixer-entry probe: `FE7_PROBE=1` now also logs at PC=0x030031AC and
+  the prologue PCs of the mixer function, recording R2/R4/R5/LR.

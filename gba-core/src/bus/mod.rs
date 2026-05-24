@@ -761,7 +761,20 @@ impl Bus {
             0x004 => {
                 // DISPSTAT: bits 0-2 are read-only (VBlank, HBlank, VCount match)
                 // Only bits 3-15 are writable
+                let old = self.io.dispstat;
                 self.io.dispstat = (self.io.dispstat & 0x07) | (val & !0x07);
+                // IRQ_GATE_TRACE: log changes to HBlank-IRQ-enable bit (4),
+                // VBlank-IRQ-enable bit (3), or VCount-IRQ-enable bit (5).
+                static IRQ_GATE_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let trace = *IRQ_GATE_TRACE.get_or_init(|| std::env::var("IRQ_GATE_TRACE").is_ok());
+                if trace && (old & 0x38) != (self.io.dispstat & 0x38) {
+                    let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("[IRQ-GATE] write DISPSTAT: 0x{:04X} -> 0x{:04X} (HB-en={}->{}, VB-en={}->{}) cyc={}",
+                        old, self.io.dispstat,
+                        (old >> 4) & 1, (self.io.dispstat >> 4) & 1,
+                        (old >> 3) & 1, (self.io.dispstat >> 3) & 1,
+                        cyc);
+                }
             }
             // VCOUNT is read-only
             0x006 => {}
