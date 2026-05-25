@@ -104,6 +104,14 @@ pub struct Bus {
     ///     pairs encode (N, S) wait cycles added on top of 1 cycle.
     #[serde(skip)]
     pub mem_access_cycles: u32,
+    /// Address of the previous memory access, used to detect sequential
+    /// (S-cycle) vs non-sequential (N-cycle) access patterns. An access is
+    /// "sequential" if its address equals last_access_end and is in the
+    /// same region — true for consecutive instruction fetches, LDM/STM
+    /// register list elements, etc. Sequential ROM access is much cheaper
+    /// than non-sequential.
+    #[serde(skip)]
+    pub last_access_end: u32,
 }
 
 impl Bus {
@@ -147,7 +155,16 @@ impl Bus {
             halt_requested: false,
             last_pc: 0,
             mem_access_cycles: 0,
+            last_access_end: 0xFFFFFFFF,
         }
+    }
+
+    /// Force the next memory access to count as non-sequential. Called
+    /// after a branch, mode switch, or any event that invalidates the
+    /// sequential prediction.
+    #[inline]
+    pub fn break_sequential(&mut self) {
+        self.last_access_end = 0xFFFFFFFF;
     }
 
     /// Decode WAITCNT to (N_wait, S_wait) for a given waitstate region.
@@ -179,11 +196,17 @@ impl Bus {
         }
     }
 
-    /// Add the extra cycles for a memory access at addr.
-    /// `width_bytes` is 1, 2, or 4. `sequential` is whether this access
-    /// is sequential with the previous one (used for ROM waitstates only).
+    /// Add the extra cycles for a memory access at addr. Auto-detects
+    /// sequential vs non-sequential based on prior access.
+    /// `width_bytes` is 1, 2, or 4.
     #[inline]
-    pub fn add_mem_cycles(&mut self, addr: u32, width_bytes: u32, sequential: bool) {
+    pub fn add_mem_cycles(&mut self, addr: u32, width_bytes: u32) {
+        // Sequential if this access starts exactly where the previous one
+        // ended AND is in the same region (top byte unchanged). Otherwise
+        // non-sequential.
+        let sequential = addr == self.last_access_end
+            && (addr >> 24) == (self.last_access_end.wrapping_sub(1) >> 24);
+        self.last_access_end = addr.wrapping_add(width_bytes);
         let extra = match addr >> 24 {
             // 32-bit bus, 1-cycle access: BIOS, IWRAM, I/O, OAM. No extra.
             0x00 | 0x03 | 0x04 | 0x07 => 0,
@@ -195,13 +218,39 @@ impl Bus {
             0x05 | 0x06 => if width_bytes == 4 { 1 } else { 0 },
             // GamePak ROM: WAITCNT-controlled.
             // 0x08-0x09 → WS0, 0x0A-0x0B → WS1, 0x0C-0x0D → WS2.
+            //
+            // GamePak prefetch buffer: when WAITCNT bit 14 is set, the
+            // prefetch unit fills sequential ROM words during CPU idle
+            // cycles. The CPU then fetches them at essentially 1-cycle
+            // cost (S_wait = 0 effectively) for sequential code. Most
+            // commercial games enable this and rely on it for performance.
+            //
+            // Simplified model: if prefetch is enabled AND this access is
+            // sequential, treat as 1-cycle access (no wait). Otherwise
+            // use raw WAITCNT values.
+            //
+            // Note: this is an upper bound on prefetch benefit (assumes
+            // the prefetch buffer is always filled). A cycle-accurate
+            // model would track buffer state per cycle. For game timing
+            // this approximation is close enough.
             0x08..=0x0D => {
+                let prefetch_enabled = (self.io.waitcnt >> 14) & 1 != 0;
                 let ws = ((addr >> 24) - 0x08) / 2;
                 let (n_wait, s_wait) = self.rom_waits(ws);
-                let single_wait = if sequential { s_wait } else { n_wait };
+                let effective_s = if prefetch_enabled { 0 } else { s_wait };
+                let mut single_wait = if sequential { effective_s } else { n_wait };
+                // Diagnostic: ROM_SLOW_MULT scales ROM wait states by a
+                // factor. Use to test whether cascade is timing-sensitive.
+                static ROM_SLOW_MULT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+                let mult = *ROM_SLOW_MULT.get_or_init(|| {
+                    std::env::var("ROM_SLOW_MULT").ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1)
+                });
+                single_wait *= mult;
+                let scaled_s = effective_s * mult;
                 if width_bytes == 4 {
-                    // 32-bit access on 16-bit ROM bus = 1 non-seq + 1 seq half.
-                    single_wait + s_wait
+                    1 + single_wait + scaled_s
                 } else {
                     single_wait
                 }
@@ -222,12 +271,7 @@ impl Bus {
     // ─── 8-bit reads ──────────────────────────────────────────────
 
     pub fn read8(&mut self, addr: u32) -> u8 {
-        // For now, treat every CPU memory access as non-sequential
-        // (conservative — slightly overestimates ROM waits compared to
-        // perfect S-vs-N tracking, but produces a stable, real-hardware-
-        // like timing baseline). When prefetch and pipeline sequentiality
-        // tracking get implemented, this can be refined.
-        self.add_mem_cycles(addr, 1, false);
+        self.add_mem_cycles(addr, 1);
         let val = match addr >> 24 {
             0x00 => self.read_bios(addr),
             0x02 => self.ewram[(addr & 0x3FFFF) as usize],
@@ -248,7 +292,7 @@ impl Bus {
 
     pub fn read16(&mut self, addr: u32) -> u16 {
         let addr = addr & !1; // Force halfword alignment
-        self.add_mem_cycles(addr, 2, false);
+        self.add_mem_cycles(addr, 2);
         let val = match addr >> 24 {
             0x00 => {
                 let lo = self.read_bios(addr) as u16;
@@ -290,7 +334,7 @@ impl Bus {
 
     pub fn read32(&mut self, addr: u32) -> u32 {
         let addr = addr & !3; // Force word alignment
-        self.add_mem_cycles(addr, 4, false);
+        self.add_mem_cycles(addr, 4);
         let val = match addr >> 24 {
             0x02 => {
                 let base = (addr & 0x3FFFF) as usize;
@@ -363,7 +407,7 @@ impl Bus {
     // ─── 8-bit writes ─────────────────────────────────────────────
 
     pub fn write8(&mut self, addr: u32, val: u8) {
-        self.add_mem_cycles(addr, 1, false);
+        self.add_mem_cycles(addr, 1);
         let (mw, lo, hi) = mem_watch_range();
         if mw && addr >= lo && addr < hi {
             let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
@@ -422,7 +466,7 @@ impl Bus {
     // ─── 16-bit writes ────────────────────────────────────────────
 
     pub fn write16(&mut self, addr: u32, val: u16) {
-        self.add_mem_cycles(addr, 2, false);
+        self.add_mem_cycles(addr, 2);
         let (mw, lo, hi) = mem_watch_range();
         if mw && addr >= lo && addr < hi {
             let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
@@ -478,7 +522,7 @@ impl Bus {
     // ─── 32-bit writes ────────────────────────────────────────────
 
     pub fn write32(&mut self, addr: u32, val: u32) {
-        self.add_mem_cycles(addr, 4, false);
+        self.add_mem_cycles(addr, 4);
         let (mw, lo, hi) = mem_watch_range();
         if mw && addr >= lo && addr < hi {
             let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
@@ -1008,7 +1052,13 @@ impl Bus {
             0x202 => self.interrupt.write_if(val),
             0x208 => self.interrupt.write_ime(val),
             // WAITCNT
-            0x204 => self.io.waitcnt = val,
+            0x204 => {
+                if std::env::var("WAITCNT_TRACE").is_ok() {
+                    let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("[WAITCNT] 0x{:04X} -> 0x{:04X}  cyc={}", self.io.waitcnt, val, cyc);
+                }
+                self.io.waitcnt = val;
+            }
             // HALTCNT (written via 0x04000301, 8-bit write)
             0x300 => self.io.postflg = val as u8,
             _ => {

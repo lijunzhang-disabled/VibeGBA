@@ -239,10 +239,15 @@ impl Cpu {
         // See debug/2026-05-24_fe7-hblank-irq-cascade.md.)
 
         // Check for pending interrupts
+        let mut irq_entry_cycles = 0u32;
         if !gate_irq && bus.interrupt.has_pending() && !self.cpsr.irq_disabled() {
             self.irq_entries += 1;
             self.handle_interrupt(bus);
             self.halted = false;
+            // ARM7TDMI exception entry overhead: 3 cycles to bank registers,
+            // save CPSR to SPSR, switch mode, set PC. The pipeline-refill
+            // memory accesses are separately counted via bus.add_mem_cycles.
+            irq_entry_cycles = 3;
         }
 
         if self.halted {
@@ -266,7 +271,7 @@ impl Cpu {
             self.step_arm(bus)
         };
         let mem_cycles = bus.take_mem_cycles();
-        let total = cycles + prior_mem_cycles + mem_cycles;
+        let total = cycles + prior_mem_cycles + mem_cycles + irq_entry_cycles;
         bus.tick_backup(total);
         total
     }
@@ -379,6 +384,10 @@ impl Cpu {
     }
 
     fn refill_pipeline(&mut self, bus: &mut Bus) {
+        // Pipeline refill follows a branch / mode switch / IRQ entry, so
+        // the first fetch is non-sequential. The second (advance) fetch
+        // is naturally sequential because it's contiguous.
+        bus.break_sequential();
         if self.cpsr.thumb() {
             let pc = self.regs[15] & !1;
             // Update bus.last_pc to the actual fetch PC so the BIOS-read
