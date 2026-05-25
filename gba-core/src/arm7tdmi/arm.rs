@@ -207,7 +207,13 @@ impl Cpu {
 
         // Base: 1S cycle. ARM7TDMI adds 1 internal cycle when the shift
         // amount comes from a register (Rs) instead of an immediate.
-        1 + extra_internal_cycle
+        // When Rd is PC (data-proc writes to PC, i.e. branch), it's 2S + 1N
+        // because the pipeline refills (counted via add_mem_cycles).
+        // Adding 2 internal cycles here covers the "2S + 1N" model since
+        // the bus has only seen one access for the standard 1S baseline;
+        // the pipeline refill will add its own access cycles.
+        let pc_write_cycles = if rd == 15 { 2 } else { 0 };
+        1 + extra_internal_cycle + pc_write_cycles
     }
 
     // ─── Multiply ─────────────────────────────────────────────────
