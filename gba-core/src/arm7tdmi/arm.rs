@@ -139,15 +139,14 @@ impl Cpu {
             let rm = (opcode & 0xF) as u8;
             let shift_type = ShiftType::from_u8(((opcode >> 5) & 3) as u8);
 
-            let (shift_amount, extra_cycle) = if shift_by_reg {
+            let shift_amount = if shift_by_reg {
                 // Shift by register
                 let rs = ((opcode >> 8) & 0xF) as u8;
                 let rs_val = if rs == 15 { self.reg(15).wrapping_add(4) } else { self.reg(rs) };
-                (rs_val as u8, true)
+                rs_val as u8
             } else {
                 // Shift by immediate
-                let amount = ((opcode >> 7) & 0x1F) as u8;
-                (amount, false)
+                ((opcode >> 7) & 0x1F) as u8
             };
 
             let rm_val = if rm == 15 && shift_by_reg {
@@ -157,9 +156,9 @@ impl Cpu {
             };
 
             let immediate_shift = !shift_by_reg;
-            let _ = extra_cycle; // TODO: add extra cycle for register shift
             barrel_shift(rm_val, shift_type, shift_amount, self.cpsr.c(), immediate_shift)
         };
+        let extra_internal_cycle: u32 = if shift_by_reg { 1 } else { 0 };
 
         // Execute the ALU operation
         let (result, carry, overflow) = match op {
@@ -206,7 +205,9 @@ impl Cpu {
             self.set_reg(rd, result);
         }
 
-        1 // Base: 1S cycle
+        // Base: 1S cycle. ARM7TDMI adds 1 internal cycle when the shift
+        // amount comes from a register (Rs) instead of an immediate.
+        1 + extra_internal_cycle
     }
 
     // ─── Multiply ─────────────────────────────────────────────────

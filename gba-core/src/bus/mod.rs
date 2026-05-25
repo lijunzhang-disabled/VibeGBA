@@ -234,11 +234,16 @@ impl Bus {
             // model would track buffer state per cycle. For game timing
             // this approximation is close enough.
             0x08..=0x0D => {
-                let prefetch_enabled = (self.io.waitcnt >> 14) & 1 != 0;
                 let ws = ((addr >> 24) - 0x08) / 2;
                 let (n_wait, s_wait) = self.rom_waits(ws);
-                let effective_s = if prefetch_enabled { 0 } else { s_wait };
-                let mut single_wait = if sequential { effective_s } else { n_wait };
+                // Conservative model: do NOT apply the prefetch optimization
+                // (sequential ROM access charged full S_wait). Real GBA's
+                // prefetch buffer makes sequential fetches near-free, but
+                // implementing that accurately requires per-cycle buffer
+                // state tracking. As an approximation, charging full S_wait
+                // gives us closer-to-real-GBA timing for FE7-style audio
+                // engines that rely on a specific CPU/frame ratio.
+                //
                 // Diagnostic: ROM_SLOW_MULT scales ROM wait states by a
                 // factor. Use to test whether cascade is timing-sensitive.
                 static ROM_SLOW_MULT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -247,8 +252,8 @@ impl Bus {
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(1)
                 });
-                single_wait *= mult;
-                let scaled_s = effective_s * mult;
+                let single_wait = (if sequential { s_wait } else { n_wait }) * mult;
+                let scaled_s = s_wait * mult;
                 if width_bytes == 4 {
                     1 + single_wait + scaled_s
                 } else {
