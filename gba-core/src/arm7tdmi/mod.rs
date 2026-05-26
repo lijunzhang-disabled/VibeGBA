@@ -358,6 +358,30 @@ impl Cpu {
         // (= 2 candidate channel-list head pointers + adjacent state).
         if fe7_probe_enabled() {
             let pc = self.regs[15].wrapping_sub(4);
+            if pc == 0x08000AEE {
+                // Main loop iteration start. Track cycles + slot writes per iter.
+                let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
+                let buf_ptr = bus.peek32(0x0300_2F34);
+                static LAST_LOOP_CYC: std::sync::atomic::AtomicU64
+                    = std::sync::atomic::AtomicU64::new(0);
+                static LAST_BUF_PTR: std::sync::atomic::AtomicU32
+                    = std::sync::atomic::AtomicU32::new(0);
+                let last_cyc = LAST_LOOP_CYC.swap(cyc, std::sync::atomic::Ordering::Relaxed);
+                let last_ptr = LAST_BUF_PTR.swap(buf_ptr, std::sync::atomic::Ordering::Relaxed);
+                if last_cyc > 0 {
+                    let delta = cyc - last_cyc;
+                    let ptr_advance = buf_ptr.wrapping_sub(last_ptr);
+                    static CNT: std::sync::atomic::AtomicU64
+                        = std::sync::atomic::AtomicU64::new(0);
+                    let n = CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n % 100 == 0 {
+                        eprintln!(
+                            "[LOOP] n={n} cyc_delta={delta} ptr=0x{buf_ptr:08X} ptr_advance=0x{ptr_advance:X} slots~{}",
+                            (ptr_advance as i32 / 8).abs()
+                        );
+                    }
+                }
+            }
             if pc == 0x0801529C {
                 let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
                 let vcount = bus.io.vcount;

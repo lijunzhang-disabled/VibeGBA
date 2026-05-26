@@ -723,3 +723,57 @@ returns (= the M4A buffer corruption pattern we identified earlier).
 
 `ROM_SLOW_MULT=3` env var. Use this to play FE7 until residual
 accuracy gap is resolved.
+
+## Update 2026-05-26 part 10: real cascade trigger is slot rate per iter
+
+Instrumented the main loop at PC=0x08000AEE (the loop-back point of FE7's
+main game loop) to measure cycles AND slots written per iteration:
+
+```
+n=100 cyc_delta=6119  ptr=0x03002930 advance=0x0   slots~0   (silent)
+n=200 cyc_delta=80432 ptr=0x03002930 advance=0x0   slots~0
+n=300 cyc_delta=114772 ptr=0x03002930 advance=0x0  slots~0
+n=400 cyc_delta=154538 ptr=0x03002988 advance=0x58 slots~11  (music starts)
+n=500 cyc_delta=184115 ptr=0x03002988 advance=0x58 slots~11
+n=600 cyc_delta=88891  ptr=0x030029E0 advance=0x58 slots~11
+n=700 cyc_delta=39530  ptr=0x03002DF8 advance=0x198 slots~51  (heavy audio)
+n=800 cyc_delta=42015  ptr=0x03002EF0 advance=0x1B0 slots~54
+n=900 cyc_delta=42036  ptr=0x03002C90 advance=0x1B0 slots~54  (cascading)
+```
+
+**Key insight**: each iteration writes **51-54 slots** in the cascade-leading
+phase. At ~3.5 iter/frame, that's 180+ slots/frame. The 192-slot buffer at
+IWRAM 0x2930..0x2F30 fills in less than 4 iterations. The once-per-frame
+reset (VBlank handler at pc=0x08003310) doesn't fire often enough to stay
+ahead of writes.
+
+**So the cascade isn't a cycle-counting issue**. Our iter count is roughly
+correct (~3.5/frame). The issue is the audio engine generates too many
+slots per iter compared to real GBA.
+
+### Why real GBA writes fewer slots per iter
+
+Hypotheses:
+1. **Linked-list pruning**: real FE7's channel iterator only walks ACTIVE
+   channels each iter, dynamically rebuilt. Our trace shows 2 channel
+   list heads at 0x0202A48C/0x0202A49C, but the linked list may grow to
+   8+ entries during gameplay if we don't run the prune step.
+2. **Per-iter sample budget**: one of audio_main's 10 BL targets may cap
+   total samples mixed per iter (e.g., based on buffer space remaining).
+   We aren't running that gate.
+3. **Channel state mismatch**: real FE7's audio engine state may keep
+   channels in "ready" vs "playing" vs "done" states. We may run all of
+   them as "playing", causing more samples than real.
+
+To diagnose: instrument each BL target in audio_main (10 of them at
+0x080152A2..0x080152EC) to log entry. Compare to expected behavior.
+
+### Workaround in place
+
+`ROM_SLOW_MULT=3` env var slows ROM accesses by 3x. With slower CPU,
+iter rate drops from 3.5/frame to ~1.2/frame. At 51 slots/iter × 1.2
+= 61 slots/frame, well under the 192-slot buffer.
+
+This is a TIMING workaround for what is fundamentally an AUDIO ENGINE
+STATE issue. The real fix requires understanding why our audio engine
+produces ~6× more channel work than real GBA.
