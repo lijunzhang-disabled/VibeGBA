@@ -675,3 +675,51 @@ the `DISABLE_HBLANK_IRQ=1` workaround, we need one of:
 The workaround `DISABLE_HBLANK_IRQ=1` boots FE7 by avoiding the cascade
 entirely. To preserve correct HBlank behavior for other games, that's
 the production workaround until the cascade itself is properly fixed.
+
+## Update 2026-05-26 part 9: cycle profiler reveals user/IRQ breakdown
+
+Implemented CYCLE_PROFILE=1 env var. Per-frame breakdown for FE7 intro
+(pre-cascade) in our emulator:
+* user: ~265K cycles/frame (94%)
+* irq:  ~14K cycles/frame (5%)
+* halt: ~8K cycles/frame (3%)
+* Total: ~286K (matches expected 280896, within scheduler rounding)
+
+Each HBlank IRQ averages 60 cycles in our IRQ-mode profile. The FE7
+handler switches to System mode at PC=0x03003A30 (MSR), so the
+subhandler's cycles count as "user" not "IRQ" in the profile. The IRQ
+column is just the dispatch + ACK + cleanup.
+
+Cascade signature: post-Start press, user cycles freeze while IRQ
+cycles climb monotonically. CPU enters nested IRQ mode and never
+returns (= the M4A buffer corruption pattern we identified earlier).
+
+### Status
+
+* All cycle accounting matches GBATEK spec:
+  - ROM 32-bit non-seq: 2 + N + S cycles ✓
+  - ROM 16-bit seq: 1 + S cycles ✓
+  - ARM exception entry: 3 cycles ✓
+  - Shift-by-register: +1 internal cycle ✓
+  - SUBS PC, LR, #4: +2 cycles ✓
+* Yet empirically FE7 needs ROM_SLOW_MULT=3 to avoid cascade.
+* Pokemon Emerald: still slight audio noise.
+
+### Two remaining hypotheses
+
+1. **Some non-ROM cycle source is missing**. E.g., DMA cycles aren't
+   advancing the scheduler properly (currently they accumulate via the
+   bus.mem_access_cycles accumulator and get attributed to the next CPU
+   instruction, but the scheduler never sees them as "DMA blocking
+   time").
+
+2. **Cycle accounting is "right" but FE7's audio engine takes a
+   different code path on real GBA**. Maybe a function called from
+   audio_main does buffer-draining work that we don't trigger, so our
+   intermediate slot buffer fills monotonically while real GBA's gets
+   consumed by an audio output path we're not running.
+
+### Workaround
+
+`ROM_SLOW_MULT=3` env var. Use this to play FE7 until residual
+accuracy gap is resolved.
