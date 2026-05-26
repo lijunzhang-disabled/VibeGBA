@@ -25,6 +25,43 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // having to thread the scheduler through. Zero cost when probes don't read.
 pub static GLOBAL_CYCLES: AtomicU64 = AtomicU64::new(0);
 
+// Cycle profiler — tracks cycles spent in user mode vs IRQ mode per
+// frame. Diagnostic for finding where the FE7 ~3× cycle-counting gap
+// is hiding. Enabled with CYCLE_PROFILE=1.
+pub static PROFILE_USER_CYCLES: AtomicU64 = AtomicU64::new(0);
+pub static PROFILE_IRQ_CYCLES: AtomicU64 = AtomicU64::new(0);
+pub static PROFILE_FRAMES: AtomicU64 = AtomicU64::new(0);
+pub static PROFILE_HALT_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+pub fn cycle_profile_record(in_irq: bool, cycles: u32) {
+    if in_irq {
+        PROFILE_IRQ_CYCLES.fetch_add(cycles as u64, Ordering::Relaxed);
+    } else {
+        PROFILE_USER_CYCLES.fetch_add(cycles as u64, Ordering::Relaxed);
+    }
+}
+
+pub fn cycle_profile_record_halt(cycles: u64) {
+    PROFILE_HALT_CYCLES.fetch_add(cycles, Ordering::Relaxed);
+}
+
+pub fn cycle_profile_report() {
+    let frames = PROFILE_FRAMES.load(Ordering::Relaxed);
+    let user = PROFILE_USER_CYCLES.load(Ordering::Relaxed);
+    let irq = PROFILE_IRQ_CYCLES.load(Ordering::Relaxed);
+    let halt = PROFILE_HALT_CYCLES.load(Ordering::Relaxed);
+    if frames > 0 {
+        let total = user + irq + halt;
+        eprintln!(
+            "[PROFILE] frames={frames} user={user} ({:.1}/f) irq={irq} ({:.1}/f) halt={halt} ({:.1}/f) total={total} ({:.1}/f, expected 280896)",
+            user as f64 / frames as f64,
+            irq as f64 / frames as f64,
+            halt as f64 / frames as f64,
+            total as f64 / frames as f64,
+        );
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct TraceEntry {
     pub pc: u32,
@@ -249,6 +286,7 @@ impl Gba {
                         // if we hit an overflow boundary)
                         self.scheduler.add_cycles(chunk as u64);
                         self.tick_timers(chunk);
+                        cycle_profile_record_halt(chunk as u64);
                         remaining -= chunk;
                     }
                     if trace {
@@ -384,6 +422,13 @@ impl Gba {
                     // VBlank begins
                     self.bus.io.dispstat |= 0x0001;
                     self.vblank_entries += 1;
+                    // CYCLE_PROFILE: emit per-frame report
+                    if std::env::var("CYCLE_PROFILE").is_ok() {
+                        let f = PROFILE_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+                        if f % 60 == 0 {
+                            cycle_profile_report();
+                        }
+                    }
                     if self.bus.io.dispstat & 0x0008 != 0 {
                         self.bus.interrupt.request_irq(interrupt::Irq::VBlank);
                         self.vblank_irqs_raised += 1;

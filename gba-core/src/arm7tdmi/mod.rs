@@ -25,6 +25,11 @@ fn irq_trace_enabled() -> bool {
     *V.get_or_init(|| std::env::var("IRQ_TRACE").is_ok())
 }
 
+fn cycle_profile_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("CYCLE_PROFILE").is_ok())
+}
+
 /// FE7-specific probe: prints IF/IE/IME state at three key PCs in FE7's
 /// ARM IRQ handler so we can pinpoint *when* a new HBlank IRQ becomes
 /// pending during the ack→MSR window.
@@ -265,6 +270,7 @@ impl Cpu {
         // this step). All reads/writes from now until the end of step()
         // will be summed into bus.mem_access_cycles. We harvest below.
         let prior_mem_cycles = bus.take_mem_cycles();
+        let in_irq = self.cpsr.mode() == CpuMode::Irq;
         let cycles = if self.cpsr.thumb() {
             self.step_thumb(bus)
         } else {
@@ -272,6 +278,13 @@ impl Cpu {
         };
         let mem_cycles = bus.take_mem_cycles();
         let total = cycles + prior_mem_cycles + mem_cycles + irq_entry_cycles;
+
+        // CYCLE_PROFILE: count cycles per mode for diagnostics. Reports
+        // every PROFILE_FRAMES frames if env var set.
+        if cycle_profile_enabled() {
+            crate::cycle_profile_record(in_irq, total);
+        }
+
         bus.tick_backup(total);
         total
     }
