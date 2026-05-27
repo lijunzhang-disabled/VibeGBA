@@ -827,3 +827,58 @@ shows whether ROM-read cycles dominate and whether the proportion is
 plausible — pinpointing undercount vs miscount.
 
 Workaround remains: ROM_SLOW_MULT=3.
+
+## Update 2026-05-26 part 12: cycle-accurate prefetch — proves cascade is FUNCTIONAL
+
+Implemented a stateful GamePak prefetch buffer (WAITCNT bit 14):
+* 8-halfword buffer, fills one halfword per sequential-access time during
+  idle (non-ROM) cycles.
+* Sequential ROM code fetch: buffer hit = 1 cycle; in-flight = stall the
+  remaining fill; miss = flush + full N.
+* Non-sequential code fetch OR any ROM data access flushes the buffer.
+* New bus.fetch16/fetch32 (used by the pipeline) route ROM fetches through
+  the prefetcher; ROM data accesses (read/write) flush it.
+
+Result on FE7 (FE7_PROBE [LOOP] at the title):
+* cyc_per_instr DROPPED 3.5 → 2.75 — audio_wrapper got FASTER, not slower.
+* The buffer pointer goes wild (0x03000C1E, 0x03004F7D…) — FE7 cascades
+  EARLIER with the (correct) prefetch model.
+
+**This definitively proves the FE7 cascade is NOT a CPU-timing problem.**
+Real GBA runs the audio engine even faster than our old model (prefetch
+makes sequential ROM fetches cheap), yet real hardware does not overflow.
+So the overflow is prevented by something FUNCTIONAL in MP2K's audio
+buffer management that we get wrong.
+
+Regression check: Pokemon Emerald still boots and plays normally with the
+prefetch model. So the prefetch buffer is kept as a standalone accuracy
+improvement (correct GBA behavior), independent of FE7.
+
+### Reframed FE7 root cause (functional, not timing)
+
+Our audio_wrapper does FULL mixing work every call (~55K cycles,
+consistently — not occasionally). On real GBA, MP2K's SoundMain mixes a
+fixed-size buffer ONCE per sound-frame and early-returns / no-ops the
+other calls, gated by a counter in the SOUND_INFO struct that the sound
+interrupt (Timer/DMA-driven) advances. We call it back-to-back in the
+main loop (0x08000AEE: BL audio_wrapper; BL other_call; B loop — no
+halt), and it mixes every time, overflowing the 192-slot buffer.
+
+Candidates for the missing gate (next investigation):
+1. MP2K SOUND_INFO `pcmDmaCounter` / `cmd` field: SoundMain checks it and
+   only mixes when the sound DMA has consumed the previous buffer. If our
+   sound-DMA bookkeeping never advances/updates that field, SoundMain
+   mixes every call.
+2. A re-entrancy/"already ran this frame" flag set by m4aSoundVSync
+   (the 0x08003310 routine) and checked by SoundMain.
+3. The sound timer (Timer0) IRQ — we run Timer0 with IRQ disabled; if
+   MP2K expects a timer-driven counter advance we don't provide.
+
+Concrete next step: disassemble the first BL target inside audio_main
+(0x080152A2 → SoundMain core) and find the early-out condition; then
+trace the SOUND_INFO field it reads at runtime and see why ours never
+gates.
+
+Workaround unchanged: DISABLE_HBLANK_IRQ=1 boots FE7 (removes the HBlank
+wake that lets the main loop run between scanlines). ROM_SLOW_MULT also
+mitigates by slowing the call rate.

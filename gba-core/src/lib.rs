@@ -323,8 +323,10 @@ impl Gba {
                     }
                     break;
                 }
+                // Bus cycle clock for the prefetch model (cheap field write).
+                self.bus.now = self.scheduler.timestamp();
                 if diag {
-                    GLOBAL_CYCLES.store(self.scheduler.timestamp(), Ordering::Relaxed);
+                    GLOBAL_CYCLES.store(self.bus.now, Ordering::Relaxed);
                     INSTR_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
                 let cycles = self.cpu.step(&mut self.bus) as u64;
