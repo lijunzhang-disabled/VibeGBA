@@ -32,6 +32,13 @@ pub static PROFILE_USER_CYCLES: AtomicU64 = AtomicU64::new(0);
 pub static PROFILE_IRQ_CYCLES: AtomicU64 = AtomicU64::new(0);
 pub static PROFILE_FRAMES: AtomicU64 = AtomicU64::new(0);
 pub static PROFILE_HALT_CYCLES: AtomicU64 = AtomicU64::new(0);
+/// Total SWI invocations — used by the FE7 loop probe to measure SWIs
+/// per audio_wrapper iteration (HLE SWIs currently cost 0 emulated cycles).
+pub static SWI_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Total CPU instructions stepped (diagnostics only) — lets the FE7 loop
+/// probe split audio_wrapper's cycle cost into instruction count vs
+/// wait-state cycles.
+pub static INSTR_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Whether any cycle-stamp-consuming diagnostic is enabled. The
 /// per-instruction GLOBAL_CYCLES update is only useful when one of these
@@ -318,6 +325,7 @@ impl Gba {
                 }
                 if diag {
                     GLOBAL_CYCLES.store(self.scheduler.timestamp(), Ordering::Relaxed);
+                    INSTR_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
                 let cycles = self.cpu.step(&mut self.bus) as u64;
                 self.scheduler.add_cycles(cycles);
@@ -633,6 +641,7 @@ impl Gba {
     /// Handle a SWI (software interrupt).
     /// If no BIOS is loaded, use HLE. Otherwise, jump to the BIOS SWI vector.
     fn handle_swi(&mut self, swi_num: u8) {
+        SWI_COUNT.fetch_add(1, Ordering::Relaxed);
         if self.bus.has_bios {
             // Real BIOS: trigger the SWI exception normally
             self.cpu.software_interrupt(swi_num as u32);

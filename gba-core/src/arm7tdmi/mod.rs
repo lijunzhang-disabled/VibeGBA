@@ -368,9 +368,16 @@ impl Cpu {
                 static AUDIO_SUM: AtomicU64 = AtomicU64::new(0);
                 static OTHER_SUM: AtomicU64 = AtomicU64::new(0);
                 static CNT: AtomicU64 = AtomicU64::new(0);
+                static AEE_INSTR: AtomicU64 = AtomicU64::new(0);
+                static AUDIO_INSTR_SUM: AtomicU64 = AtomicU64::new(0);
                 if pc == 0x08000AF2 {
                     let aee = AEE_CYC.load(Ordering::Relaxed);
-                    if aee > 0 { AUDIO_SUM.fetch_add(cyc - aee, Ordering::Relaxed); }
+                    if aee > 0 {
+                        AUDIO_SUM.fetch_add(cyc - aee, Ordering::Relaxed);
+                        let ic = crate::INSTR_COUNT.load(Ordering::Relaxed);
+                        let aee_ic = AEE_INSTR.load(Ordering::Relaxed);
+                        if aee_ic > 0 { AUDIO_INSTR_SUM.fetch_add(ic - aee_ic, Ordering::Relaxed); }
+                    }
                     AF2_CYC.store(cyc, Ordering::Relaxed);
                 } else {
                     let af2 = AF2_CYC.load(Ordering::Relaxed);
@@ -381,13 +388,16 @@ impl Cpu {
                             let a = AUDIO_SUM.load(Ordering::Relaxed);
                             let o = OTHER_SUM.load(Ordering::Relaxed);
                             let buf_ptr = bus.peek32(0x0300_2F34);
+                            let ai = AUDIO_INSTR_SUM.load(Ordering::Relaxed);
+                            let cpi = if ai > 0 { a as f64 / ai as f64 } else { 0.0 };
                             eprintln!(
-                                "[LOOP] n={n} audio_avg={} other_avg={} iter_avg={} ptr=0x{buf_ptr:08X}",
-                                a / n, o / n, (a + o) / n
+                                "[LOOP] n={n} audio_avg={} audio_instr={} cyc_per_instr={cpi:.2} other_avg={} ptr=0x{buf_ptr:08X}",
+                                a / n, ai / n, o / n
                             );
                         }
                     }
                     AEE_CYC.store(cyc, Ordering::Relaxed);
+                    AEE_INSTR.store(crate::INSTR_COUNT.load(Ordering::Relaxed), Ordering::Relaxed);
                 }
             }
             if pc == 0x0801529C {
