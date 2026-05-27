@@ -416,6 +416,12 @@ fn main() {
     let tile_trace = std::env::var("TILE_TRACE").is_ok();
     let mut last_player_xy: (i16, i16) = (i16::MIN, i16::MIN);
 
+    // PERF_TRACE=1: measure real FPS + host busy-time per frame.
+    let perf_trace = std::env::var("PERF_TRACE").is_ok();
+    let mut perf_window_start = Instant::now();
+    let mut perf_busy_ns: u64 = 0;
+    let mut perf_frames: u64 = 0;
+
     // Main emulation loop
     'running: loop {
         let frame_start = Instant::now();
@@ -590,6 +596,28 @@ fn main() {
                         eprintln!();
                     }
                 }
+            }
+        }
+
+        // PERF_TRACE=1: report effective FPS, host busy-time per frame, and
+        // audio buffer level every ~1s. Distinguishes "free-running (pacing
+        // broken)" from "can't keep up (emulation too slow)" from "fine".
+        if perf_trace {
+            let busy = frame_start.elapsed();
+            perf_busy_ns += busy.as_nanos() as u64;
+            perf_frames += 1;
+            if perf_window_start.elapsed() >= Duration::from_secs(1) {
+                let wall = perf_window_start.elapsed();
+                let fps = perf_frames as f64 / wall.as_secs_f64();
+                let busy_ms = (perf_busy_ns as f64 / perf_frames as f64) / 1.0e6;
+                let lvl = audio_state.as_ref().map(|(b, _)| b.level()).unwrap_or(0);
+                eprintln!(
+                    "[PERF] fps={fps:.1} busy={busy_ms:.2}ms/frame audio_level={lvl} (target={}, high={})",
+                    audio::BUFFER_TARGET, audio::BUFFER_HIGH
+                );
+                perf_frames = 0;
+                perf_busy_ns = 0;
+                perf_window_start = Instant::now();
             }
         }
 

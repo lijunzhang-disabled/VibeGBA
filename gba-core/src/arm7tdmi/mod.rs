@@ -279,8 +279,8 @@ impl Cpu {
         let mem_cycles = bus.take_mem_cycles();
         let total = cycles + prior_mem_cycles + mem_cycles + irq_entry_cycles;
 
-        // CYCLE_PROFILE: count cycles per mode for diagnostics. Reports
-        // every PROFILE_FRAMES frames if env var set.
+        // CYCLE_PROFILE: count cycles per mode for diagnostics (env-gated,
+        // OnceLock — compiles to a single relaxed load + branch when off).
         if cycle_profile_enabled() {
             crate::cycle_profile_record(in_irq, total);
         }

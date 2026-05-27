@@ -112,6 +112,24 @@ pub struct Bus {
     /// than non-sequential.
     #[serde(skip)]
     pub last_access_end: u32,
+    /// Precomputed ROM wait-state extras, indexed [region][seq] where
+    /// region = 0/1/2 (WS0/WS1/WS2) and seq = 0 (non-seq) / 1 (seq).
+    /// Recomputed only when WAITCNT is written — avoids decoding WAITCNT
+    /// and reading the ROM_SLOW_MULT env var on every ROM access (the
+    /// hottest path, since instruction fetches are mostly from ROM).
+    /// Value is the extra cycles for a 16-bit access; 32-bit adds the
+    /// sequential half on top (see add_mem_cycles).
+    #[serde(skip)]
+    rom_wait16: [[u32; 2]; 3],
+    /// Sequential-half extra for 32-bit ROM accesses, per region.
+    #[serde(skip)]
+    rom_wait_s: [u32; 3],
+    /// ROM_SLOW_MULT debug knob, read once at construction.
+    #[serde(skip)]
+    rom_slow_mult: u32,
+    /// WAITSTATES_OFF debug knob: when true, add_mem_cycles is a no-op.
+    #[serde(skip)]
+    waitstates_off: bool,
 }
 
 impl Bus {
@@ -122,7 +140,7 @@ impl Bus {
         let mut rtc = Rtc::new();
         rtc.enabled = Rtc::detect(&rom);
 
-        Bus {
+        let mut bus = Bus {
             bios: bios_data,
             ewram: vec![0; 0x40000],
             iwram: vec![0; 0x8000],
@@ -156,6 +174,41 @@ impl Bus {
             last_pc: 0,
             mem_access_cycles: 0,
             last_access_end: 0xFFFFFFFF,
+            rom_wait16: [[0; 2]; 3],
+            rom_wait_s: [0; 3],
+            rom_slow_mult: std::env::var("ROM_SLOW_MULT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&m| m >= 1)
+                .unwrap_or(1),
+            waitstates_off: std::env::var("WAITSTATES_OFF").is_ok(),
+        };
+        bus.recompute_rom_waits();
+        bus
+    }
+
+    /// Re-initialize the wait-state cache after deserializing a save state
+    /// (the cache fields are #[serde(skip)] so they load as zero). Re-reads
+    /// the ROM_SLOW_MULT env knob and recomputes the wait tables.
+    pub fn reinit_wait_state_cache(&mut self) {
+        self.rom_slow_mult = std::env::var("ROM_SLOW_MULT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&m| m >= 1)
+            .unwrap_or(1);
+        self.last_access_end = 0xFFFFFFFF;
+        self.recompute_rom_waits();
+    }
+
+    /// Recompute the cached ROM wait-state tables from the current WAITCNT
+    /// value. Call whenever WAITCNT (I/O 0x204) is written.
+    pub fn recompute_rom_waits(&mut self) {
+        let mult = self.rom_slow_mult;
+        for ws in 0..3u32 {
+            let (n_wait, s_wait) = self.rom_waits(ws);
+            // Index by seq: [non-seq (N), seq (S)], scaled by debug mult.
+            self.rom_wait16[ws as usize] = [n_wait * mult, s_wait * mult];
+            self.rom_wait_s[ws as usize] = s_wait * mult;
         }
     }
 
@@ -201,6 +254,12 @@ impl Bus {
     /// `width_bytes` is 1, 2, or 4.
     #[inline]
     pub fn add_mem_cycles(&mut self, addr: u32, width_bytes: u32) {
+        // WAITSTATES_OFF=1: A/B toggle to measure the host-time impact of
+        // wait-state accounting + timing. When set, no extra cycles are
+        // charged (reverts to the pre-wait-state behavior). Diagnostic only.
+        if self.waitstates_off {
+            return;
+        }
         // Sequential if this access starts exactly where the previous one
         // ended AND is in the same region (top byte unchanged). Otherwise
         // non-sequential.
@@ -234,28 +293,13 @@ impl Bus {
             // model would track buffer state per cycle. For game timing
             // this approximation is close enough.
             0x08..=0x0D => {
-                let ws = ((addr >> 24) - 0x08) / 2;
-                let (n_wait, s_wait) = self.rom_waits(ws);
-                // Conservative model: do NOT apply the prefetch optimization
-                // (sequential ROM access charged full S_wait). Real GBA's
-                // prefetch buffer makes sequential fetches near-free, but
-                // implementing that accurately requires per-cycle buffer
-                // state tracking. As an approximation, charging full S_wait
-                // gives us closer-to-real-GBA timing for FE7-style audio
-                // engines that rely on a specific CPU/frame ratio.
-                //
-                // Diagnostic: ROM_SLOW_MULT scales ROM wait states by a
-                // factor. Use to test whether cascade is timing-sensitive.
-                static ROM_SLOW_MULT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-                let mult = *ROM_SLOW_MULT.get_or_init(|| {
-                    std::env::var("ROM_SLOW_MULT").ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(1)
-                });
-                let single_wait = (if sequential { s_wait } else { n_wait }) * mult;
-                let scaled_s = s_wait * mult;
+                // Use precomputed wait tables (decoded from WAITCNT on write,
+                // not per-access). Conservative model: sequential ROM access
+                // still charges full S_wait (no prefetch-buffer optimization).
+                let ws = (((addr >> 24) - 0x08) / 2) as usize;
+                let single_wait = self.rom_wait16[ws][sequential as usize];
                 if width_bytes == 4 {
-                    1 + single_wait + scaled_s
+                    1 + single_wait + self.rom_wait_s[ws]
                 } else {
                     single_wait
                 }
@@ -1063,6 +1107,7 @@ impl Bus {
                     eprintln!("[WAITCNT] 0x{:04X} -> 0x{:04X}  cyc={}", self.io.waitcnt, val, cyc);
                 }
                 self.io.waitcnt = val;
+                self.recompute_rom_waits();
             }
             // HALTCNT (written via 0x04000301, 8-bit write)
             0x300 => self.io.postflg = val as u8,

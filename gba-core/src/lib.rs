@@ -33,6 +33,24 @@ pub static PROFILE_IRQ_CYCLES: AtomicU64 = AtomicU64::new(0);
 pub static PROFILE_FRAMES: AtomicU64 = AtomicU64::new(0);
 pub static PROFILE_HALT_CYCLES: AtomicU64 = AtomicU64::new(0);
 
+/// Whether any cycle-stamp-consuming diagnostic is enabled. The
+/// per-instruction GLOBAL_CYCLES update is only useful when one of these
+/// debug probes is active, so we skip it entirely in normal play (it's an
+/// atomic store on the hottest loop). Checked once via OnceLock.
+pub fn diagnostics_active() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        const VARS: &[&str] = &[
+            "MEM_WATCH", "FE7_PROBE", "IRQ_GATE_TRACE", "WAITCNT_TRACE",
+            "TIMER_TRACE", "DMA_FIRE_TRACE", "DMA_IRQ_TRACE", "UNKNOWN_SWI_TRACE",
+            "CYCLE_PROFILE", "INSTR_TRACE_RING", "HALT_TRACE", "DUMP_PC",
+            "DMA_AUDIO_TRACE",
+        ];
+        VARS.iter().any(|v| std::env::var(v).is_ok())
+    })
+}
+
 pub fn cycle_profile_record(in_irq: bool, cycles: u32) {
     if in_irq {
         PROFILE_IRQ_CYCLES.fetch_add(cycles as u64, Ordering::Relaxed);
@@ -250,6 +268,9 @@ impl Gba {
     /// that want to pump audio samples at a finer granularity than a full frame.
     pub fn run_cycles(&mut self, cycles: u64) {
         let target_time = self.scheduler.timestamp() + cycles;
+        // Read the diagnostics flag once per call (cheap OnceLock load) so
+        // the per-instruction hot loop just checks a plain local bool.
+        let diag = diagnostics_active();
 
         while self.scheduler.timestamp() < target_time {
             let next_event_time = self.scheduler.peek_time().unwrap_or(target_time);
@@ -295,7 +316,9 @@ impl Gba {
                     }
                     break;
                 }
-                GLOBAL_CYCLES.store(self.scheduler.timestamp(), Ordering::Relaxed);
+                if diag {
+                    GLOBAL_CYCLES.store(self.scheduler.timestamp(), Ordering::Relaxed);
+                }
                 let cycles = self.cpu.step(&mut self.bus) as u64;
                 self.scheduler.add_cycles(cycles);
 
@@ -644,6 +667,8 @@ impl Gba {
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), bincode::Error> {
         let state: Gba = bincode::deserialize(data)?;
         *self = state;
+        // Wait-state cache fields are #[serde(skip)] — rebuild from WAITCNT.
+        self.bus.reinit_wait_state_cache();
         Ok(())
     }
 
