@@ -4,7 +4,7 @@ Tracking known issues, accuracy gaps, and "we'll get to it later" items
 across the emulator. Per-bug investigation logs go in dated files; this is
 the rolling list of things still worth doing.
 
-Last reviewed: **2026-05-05** (after SRTOG buzz fix; residual noise still open).
+Last reviewed: **2026-05-27** (docs synced with current FE7/wait-state status).
 
 ## ✅ RESOLVED: Pokémon Emerald save flakiness (commit b29226f)
 
@@ -35,7 +35,21 @@ not sufficient — both fixes are needed for round-trip saves to work.
 
 ## High priority — known correctness bugs
 
-### 0. Super Robot Taisen: Original Generation — visuals + most audio fixed; residual
+### 0. Fire Emblem 7 — HBlank/audio gate cascade
+Status: open; see `debug/2026-05-24_fe7-hblank-irq-cascade.md`.
+
+FE7 boots into the intro, then eventually corrupts its IRQ handler after
+the audio engine over-runs an IWRAM state table. The latest lead is not
+DMA1/Timer0 correctness: those were traced and looked healthy. The audio
+engine main at `0x0801529C` fires about 8.7 times per frame instead of
+about once, usually at a 2-scanline cadence. The immediate gate is the
+EWRAM word at `0x02024C70`.
+
+Next step: find every writer of `0x02024C70`, then verify why it remains
+non-zero across HBlank wakeups in our emulator. Workaround for exploring
+the rest of FE7: `DISABLE_HBLANK_IRQ=1`.
+
+### 1. Super Robot Taisen: Original Generation — visuals + most audio fixed; residual
 Status: visual path fixed (chip ID, see
 `debug/2026-04-30_srtog-flash-chip-id.md`). Major audio bug fixed
 2026-05-05 — the constant 59 Hz noise floor that was drowning out
@@ -53,7 +67,7 @@ uses FIFO_B during combat for SFX) might trip a related but not
 identical bug. Worth re-running the WAV/spectrum analysis on a
 combat-scene capture.
 
-### 1. 8-bit Flash region: 16-bit / 32-bit writes
+### 2. 8-bit Flash region: 16-bit / 32-bit writes
 Status: known-incomplete  
 `bus::write16` / `write32` for `0x0E…/0x0F…` currently fall through to
 no-op. Per gbatek, real hardware should write the LSB byte. We tried
@@ -63,7 +77,7 @@ Next time: identify *which* code path Pokémon takes that depends on the
 write being dropped, OR figure out what the hang's root cause is.
 Reads are correct (8-bit broadcast, fixed in 64b04c0).
 
-### 2. `bios.gba` test 001 — BIOS stale-bus latch
+### 3. `bios.gba` test 001 — BIOS stale-bus latch
 Status: known-failing  
 Test reads from address 0 outside BIOS context and expects the last
 BIOS-fetched instruction (`0xE129F000`) to be returned (open-bus latch).
@@ -73,22 +87,16 @@ BIOS execution. Doesn't affect any real game.
 
 ## Medium priority — accuracy gaps
 
-### 3. Wait state emulation (`WAITCNT`)
-Status: not modelled  
-Every memory access takes 1 cycle in our emulator. Real GBA has variable
-wait states for ROM (configurable via WAITCNT 0x04000204), EWRAM (3
-cycles per 16-bit access), Flash, etc. Net effect: our CPU is "too fast"
-by ~10-30% depending on workload.
-Doesn't break anything observable so far, but cycle-tight games
-(precision platformers, anything polling I/O in tight inner loops) could
-expose timing bugs.
+### 4. Wait state / prefetch accuracy
+Status: partially modelled
+`bus::add_mem_cycles` now charges EWRAM, palette/VRAM, and ROM wait
+states using WAITCNT N/S timing. This fixed at least one FE7 timing
+class, so the old "every memory access takes 1 cycle" note is obsolete.
 
-### 4. Game Pak prefetch buffer
-Status: not modelled  
-The GBA Game Pak has a small instruction prefetch buffer that hides ROM
-wait states for sequential code execution. Without modelling it, ROM
-fetch is artificially slow — but since item 3 (WAITCNT) is also
-missing, the two inaccuracies partially cancel.
+Remaining gap: the Game Pak prefetch buffer is not cycle-accurate. The
+current code deliberately charges sequential ROM access at full S-wait
+rather than modelling buffer fill/drain per cycle. That is good enough
+for current investigations but can diverge for tight ROM loops.
 
 ### 5. Open-bus read accuracy
 Status: simplified  
@@ -124,7 +132,7 @@ driver and don't depend on these. But some older / simpler games rely on
 the BIOS audio path.
 
 ### 8. Test more commercial games
-Status: only Pokémon Emerald + jsmolka test ROMs exercised.  
+Status: Pokémon Emerald, SRTOG, FE7, and jsmolka test ROMs have had focused attention; broader coverage is still thin.
 Bring up at least a handful of representatives:
 - Pokémon Ruby/Sapphire (same M4A engine, should work)
 - Zelda: The Minish Cap (different rendering tricks)
@@ -161,10 +169,11 @@ Possible improvements:
 ### 11. Diagnostic instrumentation cleanup
 Status: env-gated, not affecting runtime.  
 Several debug prints are in the codebase, all gated by env vars
-(`FLASH_TRACE`, `IRQ_TRACE`, `INSTR_TRACE_RING`, `DUMP_PC`). They're
-useful for next-time debugging but add a little code volume. Periodic
-review: either keep, gate behind a `cfg(debug_assertions)` instead of
-env, or move to a separate debug crate.
+(`FLASH_TRACE`, `IRQ_TRACE`, `INSTR_TRACE_RING`, `DUMP_PC`, `FE7_PROBE`,
+`MEM_WATCH`, `DMA_FIRE_TRACE`, `TIMER_TRACE`, etc.). They're useful for
+next-time debugging but add code volume. Periodic review: either keep,
+gate behind `cfg(debug_assertions)` instead of env, or move to a separate
+debug crate.
 
 ## Frontend
 

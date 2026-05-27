@@ -16,6 +16,13 @@ This folder stores three kinds of documents:
 | 2026-04-24 | [CPU accuracy sweep — 5 fixes from jsmolka test ROMs](2026-04-24_cpu-accuracy-sweep.md) | **In progress** |
 | 2026-04-25 | [Pokémon audio: FIFO DMA must be re-anchored every VBlank](2026-04-25_pokemon-audio-dma-reanchor.md) | **Fixed** (behavioural) |
 | 2026-04-26 | [Pokémon Emerald save: 8-bit Flash bus + chip ID](2026-04-26_pokemon-save-irq-banking.md) | **Fixed** |
+| 2026-04-29 | [Pokémon Emerald save: IRQ pipeline refill](2026-04-29_pokemon-save-irq-pipeline-refill.md) | **Fixed** |
+| 2026-04-30 | [SRTOG Flash chip ID](2026-04-30_srtog-flash-chip-id.md) | **Fixed** |
+| 2026-05-04 | [Env-var hot-path perf](2026-05-04_env-var-hot-path-perf.md) | **Fixed** |
+| 2026-05-05 | [SRTOG FIFO_B cross-trigger](2026-05-05_srtog-fifo-b-cross-trigger.md) | **Fixed** |
+| 2026-05-19 | [Pokémon HBlank DMA during VBlank](2026-05-19_pokemon-hblank-dma-vblank.md) | **Fixed** |
+| 2026-05-23 | [Pokémon Emerald BIOS open-bus latch](2026-05-23_pokemon-emerald-bios-open-bus.md) | **Fixed** |
+| 2026-05-24 | [FE7 HBlank/audio IRQ cascade](2026-05-24_fe7-hblank-irq-cascade.md) | **Open** |
 
 ## Concept notes
 

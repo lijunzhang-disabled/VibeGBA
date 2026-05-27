@@ -16,9 +16,9 @@ Building a GBA (Game Boy Advance) emulator from scratch in Rust. Scanline-accura
 | Phase 6: Audio | **Done** | 10 tests |
 | Phase 7: Saves + Save States | **Done** | 6 tests |
 | Phase 8: Debugger | **Optional** — add small utilities on demand | — |
-| Phase 9: Accuracy Polish | In progress (3 bugs fixed) | +3 regression tests |
+| Phase 9: Accuracy Polish | In progress (compatibility + timing polish) | Ongoing |
 
-**Total: 83 tests passing, ~8600 lines of Rust (core + frontend)**
+**Total: 90 checked-in unit tests, ~10,000 lines of Rust (core + frontend)**
 
 ### Phase 9 progress so far (see `debug/` for details)
 
@@ -28,6 +28,12 @@ Building a GBA (Game Boy Advance) emulator from scratch in Rust. Scanline-accura
 | MRS decoder mask 0xF9 → 0xFB (was misdecoding MSR) | Tightened mask | (same) |
 | No IRQ handler stub in HLE BIOS → CPU fell off BIOS end | Install 6-instruction ARM stub at 0x18 | (same) |
 | SDL2 RGB24 broken on macOS → white screen | Switched to ARGB8888 + software renderer | — |
+| Flash save IRQ resume bug | Refill pipeline before IRQ delivery after PC-writing instructions | [2026-04-29](debug/2026-04-29_pokemon-save-irq-pipeline-refill.md) |
+| Flash 8-bit bus read semantics | Broadcast 8-bit Flash/SRAM reads across 16/32-bit reads | [2026-04-26](debug/2026-04-26_pokemon-save-irq-banking.md) |
+| Pokémon Emerald BIOS/open-bus edge case | Track BIOS latch for HLE IRQ stub/open-bus reads | [2026-05-23](debug/2026-05-23_pokemon-emerald-bios-open-bus.md) |
+| HBlank DMA during VBlank | Gate HBlank DMA to visible lines only | [2026-05-19](debug/2026-05-19_pokemon-hblank-dma-vblank.md) |
+| SRTOG FIFO cross-trigger | Refill only the FIFO whose DMA destination matches the low FIFO | [2026-05-05](debug/2026-05-05_srtog-fifo-b-cross-trigger.md) |
+| FE7 HBlank/audio cascade | Still open; gate variable at `0x02024C70` is the next lead | [2026-05-24](debug/2026-05-24_fe7-hblank-irq-cascade.md) |
 
 ## GBA Hardware Summary
 
@@ -321,7 +327,7 @@ SDL2 audio callback (~60x per second):
   - `Gba::save_state()` → `bincode::serialize(&self)` (entire emulator state)
   - `Gba::load_state()` → `bincode::deserialize()` (restores exact state)
   - Frontend: zstd compression/decompression for disk storage
-  - Hotkeys: F5 = save state, F8 = load state
+  - Hotkeys: `]` = save state, `[` = load state
   - State file at `<rom_name>.state`
 
 ### Phase 8: Debugger [OPTIONAL]
@@ -344,13 +350,10 @@ SDL2 audio callback (~60x per second):
 **Goal**: Maximize game compatibility.
 
 **General:**
-- Wait states (WAITCNT: WS0/WS1/WS2 sequential/non-sequential timing)
-- Game Pak prefetch buffer
-- Open bus behavior, BIOS read protection
-- Misaligned access (forced alignment, rotated reads)
-- Forced blank, HBlank interval free
-- Sprite edge cases (priority quirks, semi-transparent + window interaction)
-- Broad game testing and fixes
+- WAITCNT wait states are implemented for EWRAM, VRAM/palette, and ROM N/S timing; Game Pak prefetch is still approximated rather than cycle-accurate.
+- Open bus behavior and BIOS read protection are implemented enough for known games, but not hardware-complete.
+- Misaligned access quirks are partially implemented and still worth review.
+- Forced blank, HBlank interval free, sprite/window/effect edge cases, and broad commercial game testing remain accuracy-polish work.
 
 **BIOS HLE — incomplete (22 of ~40 SWIs implemented):**
 
@@ -379,10 +382,11 @@ Currently missing SWIs (games that use them won't work correctly without a real 
 
 Implementation note: SWIs that are unhandled currently just log a warning and return. Games that rely on them (likely most commercial titles using BIOS audio) will silently fail audio or other features.
 
-Workaround: load a real GBA BIOS dump via `--bios gba_bios.bin`. Pokémon Emerald specifically does NOT use the BIOS sound SWIs — it ships its own sound driver — so a real BIOS won't fix Emerald audio (that's a separate CPU emulation issue, documented in `debug/2026-04-24_pokemon-emerald-noisy-audio.md`).
+Workaround: load a real GBA BIOS dump via `--bios gba_bios.bin` for games that depend on missing BIOS services. Pokémon Emerald and FE7 ship their own audio engines, so a real BIOS is not expected to fix their audio/timing bugs.
 
 **Known game-specific issues** (tracked in `debug/` folder):
-- Pokémon Emerald audio sounds like noise — sound engine bug, root cause in CPU emulation
+- Fire Emblem 7 intro can cascade through HBlank/audio wakeups and corrupt its IRQ handler; current lead is the audio gate variable at `0x02024C70`.
+- SRTOG has residual audio distortion after the major FIFO cross-trigger fix.
 - Pokémon Emerald RTC — **fixed** via S-3511 HLE in `rtc.rs`
 
 **Milestone**: High compatibility across 50+ commercial titles.

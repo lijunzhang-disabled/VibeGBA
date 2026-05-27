@@ -74,6 +74,10 @@ cargo test -p gba-core
 |---|---|
 | **`]`** (right bracket) | Save state (to `<rom_name>.state`) |
 | **`[`** (left bracket) | Load state (from `<rom_name>.state`) |
+| **D** | Dump EWRAM to `/tmp/ewram-NNN.bin` for diagnostics |
+| **I** | Dump IWRAM to `/tmp/iwram-NNN.bin` for diagnostics |
+| **R** | Dump instruction trace ring when `INSTR_TRACE_RING=1` |
+| **M/S/V** | Pokémon Emerald-specific map/metatile/var probes |
 | **Escape** | Quit the emulator |
 
 > **Save state vs. game save:**
@@ -130,8 +134,8 @@ push older backups out of the window.
 
 Save states capture the **entire emulator state** — CPU, memory, video, audio, everything — at a single instant. Unlike game saves, they work regardless of whether the game has a save feature.
 
-- **F5**: save the current state to `<rom_name>.state`
-- **F8**: load the state from `<rom_name>.state`
+- **`]`**: save the current state to `<rom_name>.state`
+- **`[`**: load the state from `<rom_name>.state`
 
 Save state files are compressed with zstd (typically 50-100 KB).
 
@@ -173,7 +177,7 @@ If you have a real GBA BIOS dump (`gba_bios.bin`, 16 KB), you can use it with `-
 
 ### Save not persisting
 - Save data is written on clean exit (Escape key or window close)
-- If the emulator crashes, the save may be lost — use save states (F5) as backup
+- If the emulator crashes, the save may be lost — use save states (`]`) as backup
 - Check that the emulator has write permission in the ROM's directory
 
 ### Performance
@@ -212,11 +216,11 @@ gba/
 
 ## Accuracy Notes
 
-This emulator is **scanline-accurate** — it renders one line at a time and processes HBlank/VBlank events correctly. This is sufficient for most commercial games but may not handle:
+This emulator is **scanline-oriented**: it renders one line at a time and processes HBlank/VBlank events through the scheduler. This is sufficient for many games but may not handle:
 
 - Mid-scanline register changes (games that modify PPU state during visible pixels)
-- Exact CPU cycle timing for DMA (some games rely on precise cycle counts)
+- Fully cycle-accurate Game Pak prefetch and DMA/CPU contention
 - Obscure ARM instruction edge cases
 - Some Flash/EEPROM save protocols used by specific games
 
-If a game doesn't work, it's likely a timing or instruction edge case. The debugger (Phase 8, planned) and accuracy improvements (Phase 9, planned) will address these.
+If a game doesn't work, it's likely a timing, bus, or instruction edge case. The project currently handles these with focused diagnostics under `debug/` rather than a full interactive debugger.

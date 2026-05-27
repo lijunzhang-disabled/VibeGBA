@@ -41,9 +41,9 @@ Controls, save-state hotkeys, BIOS info, and troubleshooting are in [`USAGE.md`]
 
 - Phases 1-7 (CPU, memory, PPU, DMA, timers, audio, saves) — **Done**
 - Phase 8 (debugger) — optional, small utilities added on demand
-- Phase 9 (accuracy polish) — ongoing; recent: Pokémon Emerald boots to title screen with music, in-game save round-trips correctly, jsmolka arm/thumb/memory test ROMs all pass
+- Phase 9 (accuracy polish) — ongoing; recent: Pokémon Emerald boots to title screen with music, in-game save round-trips correctly, jsmolka arm/thumb/memory test ROMs all pass; current active bug is FE7 HBlank/audio gate behavior
 
-90 tests passing, ~10,000 lines of Rust across `gba-core` (no-std-ready library) and `gba-frontend` (SDL2 binary).
+90 checked-in unit tests, ~10,000 lines of Rust across `gba-core` and `gba-frontend`.
 
 ## Reference
 
