@@ -358,28 +358,36 @@ impl Cpu {
         // (= 2 candidate channel-list head pointers + adjacent state).
         if fe7_probe_enabled() {
             let pc = self.regs[15].wrapping_sub(4);
-            if pc == 0x08000AEE {
-                // Main loop iteration start. Track cycles + slot writes per iter.
-                let cyc = crate::GLOBAL_CYCLES.load(std::sync::atomic::Ordering::Relaxed);
-                let buf_ptr = bus.peek32(0x0300_2F34);
-                static LAST_LOOP_CYC: std::sync::atomic::AtomicU64
-                    = std::sync::atomic::AtomicU64::new(0);
-                static LAST_BUF_PTR: std::sync::atomic::AtomicU32
-                    = std::sync::atomic::AtomicU32::new(0);
-                let last_cyc = LAST_LOOP_CYC.swap(cyc, std::sync::atomic::Ordering::Relaxed);
-                let last_ptr = LAST_BUF_PTR.swap(buf_ptr, std::sync::atomic::Ordering::Relaxed);
-                if last_cyc > 0 {
-                    let delta = cyc - last_cyc;
-                    let ptr_advance = buf_ptr.wrapping_sub(last_ptr);
-                    static CNT: std::sync::atomic::AtomicU64
-                        = std::sync::atomic::AtomicU64::new(0);
-                    let n = CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if n % 100 == 0 {
-                        eprintln!(
-                            "[LOOP] n={n} cyc_delta={delta} ptr=0x{buf_ptr:08X} ptr_advance=0x{ptr_advance:X} slots~{}",
-                            (ptr_advance as i32 / 8).abs()
-                        );
+            // Main loop split: 0xAEE = BL audio_wrapper, 0xAF2 = BL other_call.
+            // audio_cost = cyc(0xAF2) - cyc(0xAEE); other_cost = cyc(next 0xAEE) - cyc(0xAF2).
+            if pc == 0x08000AEE || pc == 0x08000AF2 {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                let cyc = crate::GLOBAL_CYCLES.load(Ordering::Relaxed);
+                static AEE_CYC: AtomicU64 = AtomicU64::new(0);
+                static AF2_CYC: AtomicU64 = AtomicU64::new(0);
+                static AUDIO_SUM: AtomicU64 = AtomicU64::new(0);
+                static OTHER_SUM: AtomicU64 = AtomicU64::new(0);
+                static CNT: AtomicU64 = AtomicU64::new(0);
+                if pc == 0x08000AF2 {
+                    let aee = AEE_CYC.load(Ordering::Relaxed);
+                    if aee > 0 { AUDIO_SUM.fetch_add(cyc - aee, Ordering::Relaxed); }
+                    AF2_CYC.store(cyc, Ordering::Relaxed);
+                } else {
+                    let af2 = AF2_CYC.load(Ordering::Relaxed);
+                    if af2 > 0 {
+                        OTHER_SUM.fetch_add(cyc - af2, Ordering::Relaxed);
+                        let n = CNT.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n % 100 == 0 {
+                            let a = AUDIO_SUM.load(Ordering::Relaxed);
+                            let o = OTHER_SUM.load(Ordering::Relaxed);
+                            let buf_ptr = bus.peek32(0x0300_2F34);
+                            eprintln!(
+                                "[LOOP] n={n} audio_avg={} other_avg={} iter_avg={} ptr=0x{buf_ptr:08X}",
+                                a / n, o / n, (a + o) / n
+                            );
+                        }
                     }
+                    AEE_CYC.store(cyc, Ordering::Relaxed);
                 }
             }
             if pc == 0x0801529C {

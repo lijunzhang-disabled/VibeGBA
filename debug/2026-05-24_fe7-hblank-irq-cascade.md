@@ -777,3 +777,53 @@ iter rate drops from 3.5/frame to ~1.2/frame. At 51 slots/iter × 1.2
 This is a TIMING workaround for what is fundamentally an AUDIO ENGINE
 STATE issue. The real fix requires understanding why our audio engine
 produces ~6× more channel work than real GBA.
+
+## Update 2026-05-26 part 11: gap localized to audio_wrapper cycle cost
+
+Split each main-loop iteration (ROM 0x08000AEE = BL audio_wrapper,
+0x08000AF2 = BL other_call) into per-call cycle costs:
+
+```
+[LOOP] audio_avg=58000..100000  other_avg=227  ptr=0x0300_29xx..2E58
+```
+
+Findings:
+* **other_call (0x08002CF4) is a ~227-cycle no-op gate.** It calls
+  0x08002CA4 which returns 0, so other_call returns immediately. The
+  game's rendering/logic is NOT in the main loop — it runs in IRQ
+  handlers. So the main loop is effectively `loop { audio_wrapper(); }`.
+* Therefore the audio_wrapper CALL RATE = available_cycles /
+  audio_wrapper_cost. Nothing else fills the frame.
+* At the title screen, the mixer buffer pointer oscillates 0x2930..0x2E58
+  — well under the 0x2F30 overflow point. No cascade there. The cascade
+  is Start-only (heavier audio: more samples mixed per call).
+
+**Conclusion**: the residual 3× gap (FE7 needs ROM_SLOW_MULT=3) is
+entirely in audio_wrapper's cycle cost. Real GBA's audio_wrapper takes
+~3× more cycles than ours, so real GBA calls it ~1.2×/frame vs our
+~3.5×/frame. audio_wrapper is ROM-heavy:
+  * THUMB code in ROM: audio_main (0x0801529C), channel iterator
+    (0x08006A64), thunks (0x08004388) — instruction fetches from ROM.
+  * The mixer (IWRAM 0x030031AC) reads sample data from ROM (R2 =
+    0x08xxxxxx) with a 6-byte stride → every sample read is a
+    non-sequential ROM access.
+
+So the remaining work is purely "audio-path ROM access cycles are
+undercounted." Candidates:
+1. ROM wait-state LUT semantics (are the {4,3,2,8}/{2,1} values TOTAL
+   access cycles or wait-on-top-of-1? If total, our base-1 + extra-LUT
+   over-counts by 1; if wait-on-top, our model is right). Needs a
+   cross-check against a reference emulator (mGBA/NBA) before touching —
+   getting it wrong silently breaks ALL game timing.
+2. The mixer's per-sample inner loop may do more ROM accesses than we
+   model (e.g., interpolation reads 2 samples, or the loop has more
+   iterations on real hardware).
+3. We may undercount instruction COUNT in the mixer (a code path or
+   loop-trip-count difference), not just per-access cost.
+
+Next concrete diagnostic: instrument add_mem_cycles to tally, over one
+audio_wrapper call, accesses-per-region and total extra cycles. That
+shows whether ROM-read cycles dominate and whether the proportion is
+plausible — pinpointing undercount vs miscount.
+
+Workaround remains: ROM_SLOW_MULT=3.
