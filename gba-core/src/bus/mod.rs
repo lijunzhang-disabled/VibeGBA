@@ -108,56 +108,16 @@ pub struct Bus {
     /// (S-cycle) vs non-sequential (N-cycle) access patterns. An access is
     /// "sequential" if its address equals last_access_end and is in the
     /// same region — true for consecutive instruction fetches, LDM/STM
-    /// register list elements, etc. Sequential ROM access is much cheaper
-    /// than non-sequential.
+    /// register list elements, etc. Kept for potential reuse by future
+    /// cycle-accurate work; not currently consulted by add_mem_cycles.
     #[serde(skip)]
     pub last_access_end: u32,
-    /// Precomputed ROM wait-state extras, indexed [region][seq] where
-    /// region = 0/1/2 (WS0/WS1/WS2) and seq = 0 (non-seq) / 1 (seq).
-    /// Recomputed only when WAITCNT is written — avoids decoding WAITCNT
-    /// and reading the ROM_SLOW_MULT env var on every ROM access (the
-    /// hottest path, since instruction fetches are mostly from ROM).
-    /// Value is the extra cycles for a 16-bit access; 32-bit adds the
-    /// sequential half on top (see add_mem_cycles).
-    #[serde(skip)]
-    rom_wait16: [[u32; 2]; 3],
-    /// Sequential-half extra for 32-bit ROM accesses, per region.
-    #[serde(skip)]
-    rom_wait_s: [u32; 3],
-    /// ROM_SLOW_MULT debug knob, read once at construction.
-    #[serde(skip)]
-    rom_slow_mult: u32,
-    /// WAITSTATES_OFF debug knob: when true, add_mem_cycles is a no-op.
-    #[serde(skip)]
-    waitstates_off: bool,
-
-    // ── GamePak prefetch buffer (WAITCNT bit 14) ──────────────────
-    /// Whether the prefetch buffer is enabled (WAITCNT bit 14). Cached.
-    #[serde(skip)]
-    pf_enabled: bool,
-    /// Running cycle clock, updated by the CPU step loop each instruction.
-    /// Lets the prefetcher know how many cycles elapsed (and thus how many
-    /// halfwords it could fill) between ROM accesses.
+    /// Running cycle clock — updated by the CPU step loop each instruction
+    /// when diagnostics are active. Read by debug probes (FE7_PROBE etc.)
+    /// to attach cycle timestamps to logs; not used for emulation
+    /// correctness.
     #[serde(skip)]
     pub now: u64,
-    /// `now` at the last ROM bus event (code fetch or data access). The
-    /// prefetcher fills during (now - pf_last_time) idle cycles.
-    #[serde(skip)]
-    pf_last_time: u64,
-    /// Address of the next halfword the CPU expects from the prefetch
-    /// stream (head of the sequential run). A code fetch at this address
-    /// is "sequential" (may hit the buffer); anything else flushes.
-    #[serde(skip)]
-    pf_head: u32,
-    /// Number of halfwords currently buffered ahead (0..=8).
-    #[serde(skip)]
-    pf_count: u32,
-    /// Cycles accumulated toward completing the next (in-flight) halfword.
-    #[serde(skip)]
-    pf_pending: u32,
-    /// Waitstate region (0/1/2) the prefetch stream is fetching from.
-    #[serde(skip)]
-    pf_ws: usize,
 }
 
 impl Bus {
@@ -168,7 +128,7 @@ impl Bus {
         let mut rtc = Rtc::new();
         rtc.enabled = Rtc::detect(&rom);
 
-        let mut bus = Bus {
+        let bus = Bus {
             bios: bios_data,
             ewram: vec![0; 0x40000],
             iwram: vec![0; 0x8000],
@@ -202,270 +162,33 @@ impl Bus {
             last_pc: 0,
             mem_access_cycles: 0,
             last_access_end: 0xFFFFFFFF,
-            rom_wait16: [[0; 2]; 3],
-            rom_wait_s: [0; 3],
-            rom_slow_mult: std::env::var("ROM_SLOW_MULT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .filter(|&m| m >= 1)
-                .unwrap_or(1),
-            waitstates_off: std::env::var("WAITSTATES_OFF").is_ok(),
-            pf_enabled: false,
             now: 0,
-            pf_last_time: 0,
-            pf_head: 0xFFFF_FFFF,
-            pf_count: 0,
-            pf_pending: 0,
-            pf_ws: 0,
         };
-        bus.recompute_rom_waits();
         bus
     }
 
-    /// Total cycles for one sequential 16-bit ROM access in region `ws`
-    /// (base 1 + S-wait extra). The prefetcher fills one halfword per this.
-    #[inline]
-    fn rom_seq_total(&self, ws: usize) -> u32 {
-        1 + self.rom_wait_s[ws]
-    }
-
-    /// Total cycles for one non-sequential 16-bit ROM access in region `ws`.
-    #[inline]
-    fn rom_nonseq_total(&self, ws: usize) -> u32 {
-        1 + self.rom_wait16[ws][0]
-    }
-
-    /// Advance the prefetch buffer by `dt` idle cycles, filling halfwords
-    /// at the sequential rate (capacity 8).
-    #[inline]
-    fn advance_prefetch(&mut self, dt: u64) {
-        if !self.pf_enabled || self.pf_count >= 8 {
-            return;
-        }
-        let fill = self.rom_seq_total(self.pf_ws);
-        self.pf_pending = self.pf_pending.saturating_add(dt.min(u32::MAX as u64) as u32);
-        while self.pf_count < 8 && self.pf_pending >= fill {
-            self.pf_pending -= fill;
-            self.pf_count += 1;
-        }
-        if self.pf_count >= 8 {
-            self.pf_pending = 0;
-        }
-    }
-
-    /// Flush the prefetch buffer (called on non-sequential code fetch or
-    /// any ROM data access — both seize the GamePak bus).
-    #[inline]
-    fn flush_prefetch(&mut self) {
-        self.pf_count = 0;
-        self.pf_pending = 0;
-        self.pf_head = 0xFFFF_FFFF;
-    }
-
-    /// Charge prefetch-aware cycles for a ROM instruction fetch of `width`
-    /// bytes (2 = THUMB, 4 = ARM) at `addr`. Adds the wait cycles (above
-    /// the base 1 already counted by the instruction) to mem_access_cycles.
-    fn rom_code_fetch(&mut self, addr: u32, width: u32) {
-        let ws = (((addr >> 24) as usize) - 0x08) / 2;
-        // Fill the buffer during the idle cycles since the last bus event.
-        let dt = self.now.saturating_sub(self.pf_last_time);
-        self.advance_prefetch(dt);
-
-        let mut total = 0u32;
-        let halfwords = width / 2;
-        for i in 0..halfwords {
-            let a = addr + i * 2;
-            if self.pf_enabled && a == self.pf_head && self.pf_count > 0 {
-                // Buffer hit — the prefetcher already paid the wait.
-                self.pf_count -= 1;
-                self.pf_head = a + 2;
-                total += 1;
-            } else if self.pf_enabled && a == self.pf_head {
-                // Sequential, but the head halfword is still in flight:
-                // stall for its remaining fill time.
-                let fill = self.rom_seq_total(ws);
-                let remaining = fill.saturating_sub(self.pf_pending).max(1);
-                self.pf_pending = 0;
-                self.pf_head = a + 2;
-                total += remaining;
-            } else {
-                // Non-sequential / miss: flush, pay full N, restart stream.
-                self.flush_prefetch();
-                self.pf_ws = ws;
-                self.pf_head = a + 2;
-                total += self.rom_nonseq_total(ws);
-            }
-        }
-        // ROM bus is busy for `total` cycles; prefetch resumes after.
-        self.pf_last_time = self.now + total as u64;
-        // `total` is the full fetch cost; the instruction already counts a
-        // base 1 per fetch, so charge the remainder as extra.
-        self.mem_access_cycles = self
-            .mem_access_cycles
-            .saturating_add(total.saturating_sub(1));
-    }
-
-    /// Instruction fetch (16-bit / THUMB). Routes ROM fetches through the
-    /// prefetch model; other regions use the normal data-read path.
-    pub fn fetch16(&mut self, addr: u32) -> u16 {
-        let addr = addr & !1;
-        if !self.waitstates_off && (0x08..=0x0D).contains(&(addr >> 24)) {
-            self.rom_code_fetch(addr, 2);
-            let val = self.read_rom16(addr);
-            self.last_read = val as u32;
-            val
-        } else {
-            self.read16(addr)
-        }
-    }
-
-    /// Instruction fetch (32-bit / ARM).
-    pub fn fetch32(&mut self, addr: u32) -> u32 {
-        let addr = addr & !3;
-        if !self.waitstates_off && (0x08..=0x0D).contains(&(addr >> 24)) {
-            self.rom_code_fetch(addr, 4);
-            let lo = self.read_rom16(addr) as u32;
-            let hi = self.read_rom16(addr + 2) as u32;
-            let val = lo | (hi << 16);
-            self.last_read = val;
-            val
-        } else {
-            self.read32(addr)
-        }
-    }
-
-    /// Re-initialize the wait-state cache after deserializing a save state
-    /// (the cache fields are #[serde(skip)] so they load as zero). Re-reads
-    /// the ROM_SLOW_MULT env knob and recomputes the wait tables.
-    pub fn reinit_wait_state_cache(&mut self) {
-        self.rom_slow_mult = std::env::var("ROM_SLOW_MULT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&m| m >= 1)
-            .unwrap_or(1);
-        self.last_access_end = 0xFFFFFFFF;
-        self.flush_prefetch();
-        self.pf_last_time = self.now;
-        self.recompute_rom_waits();
-    }
-
-    /// Recompute the cached ROM wait-state tables from the current WAITCNT
-    /// value. Call whenever WAITCNT (I/O 0x204) is written.
-    pub fn recompute_rom_waits(&mut self) {
-        let mult = self.rom_slow_mult;
-        for ws in 0..3u32 {
-            let (n_wait, s_wait) = self.rom_waits(ws);
-            // Index by seq: [non-seq (N), seq (S)], scaled by debug mult.
-            self.rom_wait16[ws as usize] = [n_wait * mult, s_wait * mult];
-            self.rom_wait_s[ws as usize] = s_wait * mult;
-        }
-        // WAITCNT bit 14 = GamePak prefetch enable.
-        self.pf_enabled = self.io.waitcnt & (1 << 14) != 0;
-    }
-
-    /// Force the next memory access to count as non-sequential. Called
-    /// after a branch, mode switch, or any event that invalidates the
-    /// sequential prediction.
+    /// Force the next memory access to count as non-sequential. Currently
+    /// a no-op (the wait-state model that consulted last_access_end was
+    /// reverted; see commit history). Kept as an API stub so call sites
+    /// (refill_pipeline, mode-switch paths) don't need to change if a
+    /// future cycle-accurate model wants to track sequentiality again.
     #[inline]
     pub fn break_sequential(&mut self) {
         self.last_access_end = 0xFFFFFFFF;
     }
 
-    /// Decode WAITCNT to (N_wait, S_wait) for a given waitstate region.
-    /// `ws` is 0/1/2 corresponding to WS0 (0x08-0x09), WS1 (0x0A-0x0B), WS2 (0x0C-0x0D).
-    /// Returns extra cycles to ADD to the 1-cycle baseline.
+    /// Memory-access cycle accumulator hook. Currently a no-op (the
+    /// per-region wait-state model and GamePak prefetch buffer added
+    /// earlier this session caused subtle audio-timing regressions in
+    /// Pokémon Emerald without delivering a real-hardware-match for
+    /// FE7's M4A engine — the FE7 cascade turned out to be a missing
+    /// IntrWait re-halt, not a timing gap). Kept as a stable API so
+    /// read/write paths and any future cycle work can re-enable wait
+    /// states without touching every call site.
     #[inline]
-    fn rom_waits(&self, ws: u32) -> (u32, u32) {
-        let w = self.io.waitcnt as u32;
-        // N: 2 bits → indices 0,1,2,3 → values 4,3,2,8
-        // S: 1 bit  → 0,1 → values varies by WS
-        let n_table: [u32; 4] = [4, 3, 2, 8];
-        match ws {
-            0 => {
-                let n = n_table[((w >> 2) & 0x3) as usize];
-                let s = if (w >> 4) & 1 != 0 { 1 } else { 2 };
-                (n, s)
-            }
-            1 => {
-                let n = n_table[((w >> 5) & 0x3) as usize];
-                let s = if (w >> 7) & 1 != 0 { 1 } else { 4 };
-                (n, s)
-            }
-            2 => {
-                let n = n_table[((w >> 8) & 0x3) as usize];
-                let s = if (w >> 10) & 1 != 0 { 1 } else { 8 };
-                (n, s)
-            }
-            _ => (4, 2),
-        }
-    }
+    pub fn add_mem_cycles(&mut self, _addr: u32, _width_bytes: u32) {}
 
-    /// Add the extra cycles for a memory access at addr. Auto-detects
-    /// sequential vs non-sequential based on prior access.
-    /// `width_bytes` is 1, 2, or 4.
-    #[inline]
-    pub fn add_mem_cycles(&mut self, addr: u32, width_bytes: u32) {
-        // WAITSTATES_OFF=1: A/B toggle to measure the host-time impact of
-        // wait-state accounting + timing. When set, no extra cycles are
-        // charged (reverts to the pre-wait-state behavior). Diagnostic only.
-        if self.waitstates_off {
-            return;
-        }
-        // (Data accesses; instruction fetches go through fetch16/fetch32 +
-        // the prefetch model. ROM data is always non-sequential and flushes
-        // the prefetch buffer, so no sequential tracking is needed here.)
-        let extra = match addr >> 24 {
-            // 32-bit bus, 1-cycle access: BIOS, IWRAM, I/O, OAM. No extra.
-            0x00 | 0x03 | 0x04 | 0x07 => 0,
-            // EWRAM: 16-bit bus, 3-cycle access. Extra = 2 per halfword.
-            // For 32-bit, it's two 16-bit accesses = 6 total → 5 extra.
-            0x02 => if width_bytes == 4 { 5 } else { 2 },
-            // Palette / VRAM: 16-bit bus, 1-cycle each half.
-            // 32-bit = 2 cycles total → 1 extra.
-            0x05 | 0x06 => if width_bytes == 4 { 1 } else { 0 },
-            // GamePak ROM: WAITCNT-controlled.
-            // 0x08-0x09 → WS0, 0x0A-0x0B → WS1, 0x0C-0x0D → WS2.
-            //
-            // GamePak prefetch buffer: when WAITCNT bit 14 is set, the
-            // prefetch unit fills sequential ROM words during CPU idle
-            // cycles. The CPU then fetches them at essentially 1-cycle
-            // cost (S_wait = 0 effectively) for sequential code. Most
-            // commercial games enable this and rely on it for performance.
-            //
-            // Simplified model: if prefetch is enabled AND this access is
-            // sequential, treat as 1-cycle access (no wait). Otherwise
-            // use raw WAITCNT values.
-            //
-            // Note: this is an upper bound on prefetch benefit (assumes
-            // the prefetch buffer is always filled). A cycle-accurate
-            // model would track buffer state per cycle. For game timing
-            // this approximation is close enough.
-            0x08..=0x0D => {
-                // ROM DATA access (not an instruction fetch — those go via
-                // fetch16/fetch32 and the prefetch model). A data access
-                // seizes the GamePak bus: it flushes the prefetch buffer and
-                // is always non-sequential from the prefetcher's view.
-                let ws = (((addr >> 24) - 0x08) / 2) as usize;
-                self.flush_prefetch();
-                let extra = if width_bytes == 4 {
-                    // 32-bit data: 1 N half + 1 S half.
-                    1 + self.rom_wait16[ws][0] + self.rom_wait_s[ws]
-                } else {
-                    self.rom_wait16[ws][0]
-                };
-                // Mark the bus busy until after this access so the next code
-                // fetch sees the elapsed-since reset correctly.
-                self.pf_last_time = self.now + (1 + extra) as u64;
-                extra
-            }
-            // GamePak SRAM / unmapped — 0 extra (rare for code/data).
-            _ => 0,
-        };
-        self.mem_access_cycles = self.mem_access_cycles.saturating_add(extra);
-    }
-
-    /// Take and reset the accumulated memory-access cycles. Called by the
-    /// CPU step loop after each instruction executes.
+    /// Take and reset the accumulated memory-access cycles.
     #[inline]
     pub fn take_mem_cycles(&mut self) -> u32 {
         std::mem::replace(&mut self.mem_access_cycles, 0)
@@ -1261,7 +984,6 @@ impl Bus {
                     eprintln!("[WAITCNT] 0x{:04X} -> 0x{:04X}  cyc={}", self.io.waitcnt, val, cyc);
                 }
                 self.io.waitcnt = val;
-                self.recompute_rom_waits();
             }
             // HALTCNT (written via 0x04000301, 8-bit write)
             0x300 => self.io.postflg = val as u8,

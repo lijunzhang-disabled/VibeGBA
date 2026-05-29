@@ -691,8 +691,6 @@ impl Gba {
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), bincode::Error> {
         let state: Gba = bincode::deserialize(data)?;
         *self = state;
-        // Wait-state cache fields are #[serde(skip)] — rebuild from WAITCNT.
-        self.bus.reinit_wait_state_cache();
         Ok(())
     }
 

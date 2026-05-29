@@ -436,21 +436,19 @@ impl Cpu {
     #[inline]
     fn advance_arm_pipeline(&mut self, bus: &mut Bus) {
         self.pipeline[0] = self.pipeline[1];
-        self.pipeline[1] = bus.fetch32(self.regs[15]);
+        self.pipeline[1] = bus.read32(self.regs[15]);
         self.regs[15] = self.regs[15].wrapping_add(4);
     }
 
     #[inline]
     fn advance_thumb_pipeline(&mut self, bus: &mut Bus) {
         self.pipeline[0] = self.pipeline[1];
-        self.pipeline[1] = bus.fetch16(self.regs[15]) as u32;
+        self.pipeline[1] = bus.read16(self.regs[15]) as u32;
         self.regs[15] = self.regs[15].wrapping_add(2);
     }
 
     fn refill_pipeline(&mut self, bus: &mut Bus) {
-        // Pipeline refill follows a branch / mode switch / IRQ entry, so
-        // the first fetch is non-sequential. The second (advance) fetch
-        // is naturally sequential because it's contiguous.
+        // Pipeline refill follows a branch / mode switch / IRQ entry.
         bus.break_sequential();
         if self.cpsr.thumb() {
             let pc = self.regs[15] & !1;
@@ -460,14 +458,14 @@ impl Cpu {
             // refill targets a different region than the previous step
             // (e.g. an IRQ entry jumping from ROM to BIOS 0x18).
             bus.last_pc = pc;
-            self.pipeline[0] = bus.fetch16(pc) as u32;
-            self.pipeline[1] = bus.fetch16(pc + 2) as u32;
+            self.pipeline[0] = bus.read16(pc) as u32;
+            self.pipeline[1] = bus.read16(pc + 2) as u32;
             self.regs[15] = pc + 4;
         } else {
             let pc = self.regs[15] & !3;
             bus.last_pc = pc;
-            self.pipeline[0] = bus.fetch32(pc);
-            self.pipeline[1] = bus.fetch32(pc + 4);
+            self.pipeline[0] = bus.read32(pc);
+            self.pipeline[1] = bus.read32(pc + 4);
             self.regs[15] = pc + 8;
         }
         self.pipeline_flushed = false;
