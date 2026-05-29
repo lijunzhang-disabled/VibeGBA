@@ -532,6 +532,13 @@ impl Gba {
                 } else if line == 0 {
                     // VBlank ends, new frame starts
                     self.bus.io.dispstat &= !0x0001;
+                    // Reload BG2/BG3 internal reference points from the
+                    // latched BGxX/BGxY registers. Without this, the
+                    // internal refs keep accumulating PB/PD per scanline
+                    // across frames, causing affine BGs (e.g. PokéNav's
+                    // region map) to appear to scroll/rotate vertically
+                    // forever.
+                    self.bus.ppu.on_vblank(&self.bus.io);
                 }
 
                 // Schedule next HBlank

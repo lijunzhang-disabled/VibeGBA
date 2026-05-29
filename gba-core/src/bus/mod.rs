@@ -866,19 +866,19 @@ impl Bus {
             0x022 => self.io.bg2_affine[1] = val,
             0x024 => self.io.bg2_affine[2] = val,
             0x026 => self.io.bg2_affine[3] = val,
-            0x028 => self.io.write_bg_ref_low(2, 0, val),
-            0x02A => self.io.write_bg_ref_high(2, 0, val),
-            0x02C => self.io.write_bg_ref_low(2, 1, val),
-            0x02E => self.io.write_bg_ref_high(2, 1, val),
+            0x028 => { self.io.write_bg_ref_low(2, 0, val);  self.ppu.reload_bg_ref(2, 0, &self.io); }
+            0x02A => { self.io.write_bg_ref_high(2, 0, val); self.ppu.reload_bg_ref(2, 0, &self.io); }
+            0x02C => { self.io.write_bg_ref_low(2, 1, val);  self.ppu.reload_bg_ref(2, 1, &self.io); }
+            0x02E => { self.io.write_bg_ref_high(2, 1, val); self.ppu.reload_bg_ref(2, 1, &self.io); }
             // BG3 affine
             0x030 => self.io.bg3_affine[0] = val,
             0x032 => self.io.bg3_affine[1] = val,
             0x034 => self.io.bg3_affine[2] = val,
             0x036 => self.io.bg3_affine[3] = val,
-            0x038 => self.io.write_bg_ref_low(3, 0, val),
-            0x03A => self.io.write_bg_ref_high(3, 0, val),
-            0x03C => self.io.write_bg_ref_low(3, 1, val),
-            0x03E => self.io.write_bg_ref_high(3, 1, val),
+            0x038 => { self.io.write_bg_ref_low(3, 0, val);  self.ppu.reload_bg_ref(3, 0, &self.io); }
+            0x03A => { self.io.write_bg_ref_high(3, 0, val); self.ppu.reload_bg_ref(3, 0, &self.io); }
+            0x03C => { self.io.write_bg_ref_low(3, 1, val);  self.ppu.reload_bg_ref(3, 1, &self.io); }
+            0x03E => { self.io.write_bg_ref_high(3, 1, val); self.ppu.reload_bg_ref(3, 1, &self.io); }
             // Window
             0x040 => {
                 if win_trace_enabled() {

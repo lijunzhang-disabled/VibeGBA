@@ -294,6 +294,19 @@ impl Ppu {
         self.bg3_ref_y = io.bg3y_latch;
     }
 
+    /// Immediately reload the internal reference for a single BG/coord
+    /// from the latch. Real hardware does this whenever the CPU writes
+    /// BG2X/BG2Y/BG3X/BG3Y mid-frame.
+    pub fn reload_bg_ref(&mut self, bg: usize, coord: usize, io: &IoRegisters) {
+        match (bg, coord) {
+            (2, 0) => self.bg2_ref_x = io.bg2x_latch,
+            (2, 1) => self.bg2_ref_y = io.bg2y_latch,
+            (3, 0) => self.bg3_ref_x = io.bg3x_latch,
+            (3, 1) => self.bg3_ref_y = io.bg3y_latch,
+            _ => {}
+        }
+    }
+
     // ─── Bitmap modes ─────────────────────────────────────────────
 
     fn render_mode3(&self, line: u16, vram: &[u8], framebuffer: &mut [u16]) {
