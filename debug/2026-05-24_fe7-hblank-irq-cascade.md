@@ -1,10 +1,24 @@
 # FE7 intro hang — nested HBlank IRQ cascade
 
-Status: **FIXED** (commit `bb4b916`, 2026-05-29). FE7 boots cleanly out of the box; no env-var workaround needed. The chronological log below documents the dead ends as well as the resolution — see "Final resolution (2026-05-29)" at the bottom for the actual fix.
+Status: **FIXED** (commit `bb4b916`, 2026-05-29). FE7 boots cleanly out of the box; no env-var workaround needed.
+
+> ⚠️ **Reader's note**: this doc is a chronological hunt log. Parts 1–12
+> (2026-05-24 .. 05-26) walk through wait-state and prefetch-buffer
+> investigations that turned out to be **dead ends** — they did not fix
+> FE7, and they introduced subtle audio noise in Pokémon Emerald. All
+> that code was **reverted in commit `d9b57ea`** (2026-05-29). The
+> actual fix is the IntrWait re-halt gate (commit `bb4b916`), described
+> in the "Final resolution (2026-05-29)" section at the bottom. If you
+> just want the answer, jump there. The chronology is preserved as a
+> record of the wrong turns so a future investigator can recognise
+> them — especially the *trap* of attributing functional bugs (here, a
+> missing HLE BIOS loop) to timing accuracy.
 
 Root cause (one line): HLE SWI 0x05 (`VBlankIntrWait`) only set `cpu.halted = true` and let any pending IRQ wake the CPU — but real BIOS implements it as a HALT-then-recheck loop, re-halting on non-VBlank IRQs. Without the gate, HBlank IRQs (159/frame) woke FE7's `WaitForVBlank` prematurely, the main loop iterated 3.5×/frame instead of once, and the M4A audio engine overflowed its 192-slot channel buffer at IWRAM `0x2930`, corrupting the IRQ handler at `0x03003950` → cascade.
 
 Fix (10 lines, in `bb4b916`): new `cpu.intrwait_mask` field set by SWI 0x04/0x05; halt-wake check gated on the mask so only a matching IRQ clears halted.
+
+Wait-state / prefetch work (parts 1–12) was reverted because A/B testing with `WAITSTATES_OFF=1` proved (a) the IntrWait gate alone fully fixes FE7 with timing disabled, (b) wait-state accounting was the cause of Pokémon Emerald's audio noise. Spec-correct ARM cycle fixes (shift-by-register +1I, PC-write +2, IRQ entry +3) and the diagnostic infrastructure (probes, trace ring, `PERF_TRACE`, `CYCLE_PROFILE`) were kept — those changes were small and independently useful.
 
 ## Symptom
 
@@ -68,6 +82,11 @@ All env-gated, no perf impact when unset:
 - `DISABLE_HBLANK_IRQ=1` — short-circuits the HBlank IRQ fire path. The current workaround for booting FE7.
 
 ## Update 2026-05-24: cascade trigger is NOT a cycle-budget issue
+
+> ⚠️ Held up partially. The self-corruption / overflow chain described
+> here is real, but the *upstream cause* is the IntrWait bug from the
+> final resolution, not the per-instruction timing direction this part
+> opens. Parts 9–12 will revise the diagnosis.
 
 A finer-grained probe (`FE7_PROBE=1` with bit-level breakpoints) traced the
 cascade trigger to a SPECIFIC instruction-level corruption — not a per-call
@@ -541,6 +560,13 @@ overshoot perfectly. Likely scenarios:
 
 ## Update 2026-05-25 part 7: HLE SWI 0x04/0x05 fix — partial; still WIP
 
+> 💡 **The diagnosis here is correct** — this was actually the right
+> direction. But the implementation conflated two changes (BIOS_IF
+> mirror writes in `handle_interrupt` *and* the SWI HLE), and the
+> BIOS_IF write fought with FE7's own user IRQ handler. Reverted in
+> part 8. The clean version of just-this-diagnosis is the final
+> resolution at the bottom (`bb4b916`, 2026-05-29).
+
 ### What was missing
 
 Our HLE BIOS handled SWI 0x04 (IntrWait) and SWI 0x05 (VBlankIntrWait)
@@ -682,6 +708,10 @@ the production workaround until the cascade itself is properly fixed.
 
 ## Update 2026-05-26 part 9: cycle profiler reveals user/IRQ breakdown
 
+> ❌ **Dead end.** The cycle-budget math in this part led to the wait-
+> state + prefetch investigation in parts 10–12, all reverted in
+> `d9b57ea`. The profiling tooling itself (`CYCLE_PROFILE`) was kept.
+
 Implemented CYCLE_PROFILE=1 env var. Per-frame breakdown for FE7 intro
 (pre-cascade) in our emulator:
 * user: ~265K cycles/frame (94%)
@@ -729,6 +759,13 @@ returns (= the M4A buffer corruption pattern we identified earlier).
 accuracy gap is resolved.
 
 ## Update 2026-05-26 part 10: real cascade trigger is slot rate per iter
+
+> ❌ **Dead end.** The "slot rate per iter" framing is descriptively
+> correct but masks the upstream cause — slot rate is high because the
+> main loop iterates 3.5×/frame, and the main loop iterates 3.5×/frame
+> because `VBlankIntrWait` doesn't actually wait (see final resolution).
+> The fix is to make the main loop run once per frame, not to throttle
+> what the audio engine does inside each call.
 
 Instrumented the main loop at PC=0x08000AEE (the loop-back point of FE7's
 main game loop) to measure cycles AND slots written per iteration:
@@ -784,6 +821,11 @@ produces ~6× more channel work than real GBA.
 
 ## Update 2026-05-26 part 11: gap localized to audio_wrapper cycle cost
 
+> ❌ **Dead end.** The 3× cycle gap chased here was an *artifact* of
+> the main loop running 3× too often (which an IntrWait fix eliminates
+> trivially), not a per-instruction cycle-accounting bug. Pursuing it
+> led to the wait-state and prefetch work, all reverted.
+
 Split each main-loop iteration (ROM 0x08000AEE = BL audio_wrapper,
 0x08000AF2 = BL other_call) into per-call cycle costs:
 
@@ -833,6 +875,15 @@ plausible — pinpointing undercount vs miscount.
 Workaround remains: ROM_SLOW_MULT=3.
 
 ## Update 2026-05-26 part 12: cycle-accurate prefetch — proves cascade is FUNCTIONAL
+
+> 💡 **Diagnosis correct, fix wrong.** This part correctly concluded
+> the cascade is functional, not timing — but then guessed wrong about
+> WHICH function (suspected MP2K's SoundMain mix-gate). The actual
+> functional bug is in our HLE SWI 0x05 (one level up the stack), found
+> two days later by reading pokeemerald's main.c. The prefetch buffer
+> implementation itself was reverted in `d9b57ea` (it was technically
+> correct but caused Pokémon Emerald audio noise without delivering a
+> FE7 fix).
 
 Implemented a stateful GamePak prefetch buffer (WAITCNT bit 14):
 * 8-halfword buffer, fills one halfword per sequential-access time during
