@@ -191,10 +191,14 @@ fn swi_intr_wait(cpu: &mut Cpu, bus: &mut Bus) {
         bus.write16(0x0300_7FF8, current & !irq_flags);
     }
 
-    // For HLE, we just halt the CPU. The interrupt handler will resume it
-    // when the requested IRQ fires. (Note: this is not 100% spec — real
-    // BIOS loops, re-halting if a non-matching IRQ wakes it. See FE7
-    // debug doc for an attempt to implement this correctly.)
+    // Record the wait mask so the halt-wake logic only wakes on a MATCHING
+    // IRQ (per GBATEK: real BIOS implements this as a loop that re-halts
+    // after non-matching IRQs). Without this gate, e.g. HBlank IRQs would
+    // wake VBlankIntrWait prematurely and let the main game loop iterate
+    // many times per frame instead of once — observed in FE7 (3.5
+    // iter/frame vs 1) causing the M4A mixer to overflow the channel-state
+    // buffer.
+    cpu.intrwait_mask = if irq_flags != 0 { irq_flags } else { 0xFFFF };
     cpu.halted = true;
 }
 

@@ -176,6 +176,14 @@ pub struct Cpu {
     pub irq_entries: u64,
     /// CPU is halted (waiting for interrupt).
     pub halted: bool,
+    /// SWI 0x04/0x05 IntrWait mask. When non-zero, indicates the CPU
+    /// halted via IntrWait/VBlankIntrWait waiting for a SPECIFIC IRQ —
+    /// only an IRQ in this mask should wake it. Zero means HALTCNT-style
+    /// halt (any IRQ wakes). Set by HLE SWI 0x04/0x05, cleared on wake.
+    /// THIS DIFFERS FROM REAL HW: real BIOS implements the loop in BIOS
+    /// code; we emulate the semantic in the halt-wake check.
+    #[serde(default)]
+    pub intrwait_mask: u16,
     /// Pending SWI comment (set by SWI instruction, consumed by Gba::step).
     pub(crate) pending_swi: Option<u8>,
 }
@@ -190,6 +198,7 @@ impl Cpu {
             pipeline_flushed: true,
             irq_entries: 0,
             halted: false,
+            intrwait_mask: 0,
             pending_swi: None,
         };
         // ARM7TDMI starts in ARM mode, Supervisor, at address 0x00000000
