@@ -1,6 +1,10 @@
 # FE7 intro hang — nested HBlank IRQ cascade
 
-Status: **NOT FIXED.** Workaround: `DISABLE_HBLANK_IRQ=1`. Documents the investigation and where to pick up.
+Status: **FIXED** (commit `bb4b916`, 2026-05-29). FE7 boots cleanly out of the box; no env-var workaround needed. The chronological log below documents the dead ends as well as the resolution — see "Final resolution (2026-05-29)" at the bottom for the actual fix.
+
+Root cause (one line): HLE SWI 0x05 (`VBlankIntrWait`) only set `cpu.halted = true` and let any pending IRQ wake the CPU — but real BIOS implements it as a HALT-then-recheck loop, re-halting on non-VBlank IRQs. Without the gate, HBlank IRQs (159/frame) woke FE7's `WaitForVBlank` prematurely, the main loop iterated 3.5×/frame instead of once, and the M4A audio engine overflowed its 192-slot channel buffer at IWRAM `0x2930`, corrupting the IRQ handler at `0x03003950` → cascade.
+
+Fix (10 lines, in `bb4b916`): new `cpu.intrwait_mask` field set by SWI 0x04/0x05; halt-wake check gated on the mask so only a matching IRQ clears halted.
 
 ## Symptom
 
@@ -882,3 +886,146 @@ gates.
 Workaround unchanged: DISABLE_HBLANK_IRQ=1 boots FE7 (removes the HBlank
 wake that lets the main loop run between scanlines). ROM_SLOW_MULT also
 mitigates by slowing the call rate.
+
+## Final resolution (2026-05-29) — IntrWait gate
+
+After all the timing investigation, the real fix came from reading the
+pokeemerald M4A source (the same engine FE7 uses; "Sappy"/MP2K). Two key
+files at `~/secagentinfra/pokeemerald/`:
+
+* `src/main.c` line 167: every game's main loop ends with `WaitForVBlank()`
+  ≡ `SWI 0x05`. So FE7's main loop should run **once per VBlank**, not
+  3.5×/frame.
+* `src/m4a_1.s` line 20+ (`SoundMain`): the `ident` re-entrancy gate is
+  *only* re-entrancy protection (incremented on entry, reset at the end
+  of `SoundMainRAM` line 454-455). It does NOT throttle the mix rate.
+  So if `SoundMain` is called 3.5×/frame from the main loop, it mixes
+  3.5×/frame, period.
+
+The combination meant: real GBA's main loop calls `SoundMain` exactly
+once per VBlank, gated by `WaitForVBlank`. We were calling it
+~3.5×/frame because our HLE for `VBlankIntrWait` was wrong.
+
+Confirmation: an `SWI_TRACE=1` run of FE7 at the title showed **704
+SWI 0x05 calls** ≈ 70/sec ≈ once per frame at 60 Hz. So FE7 absolutely
+does call it; we just weren't honoring it.
+
+### The bug in our HLE
+
+```rust
+// BROKEN (one shot, woken by ANY IRQ)
+fn swi_vblank_intr_wait(cpu, bus) { cpu.halted = true; }
+```
+
+Real BIOS does (paraphrased):
+
+```
+loop {
+    HALT;
+    if (BIOS_IF & wait_mask) != 0 { break; }   // matching IRQ → wake
+}
+```
+
+So any non-matching IRQ wakes from HALT, the loop re-halts. Net effect:
+the CPU stays halted until a matching IRQ fires.
+
+### The fix
+
+```rust
+pub struct Cpu {
+    pub halted: bool,
+    pub intrwait_mask: u16,   // 0 = HALTCNT-style (any IRQ wakes)
+    ...
+}
+
+fn swi_intr_wait(cpu, bus) {
+    cpu.intrwait_mask = if r1 != 0 { r1 } else { 0xFFFF };
+    cpu.halted = true;
+}
+
+// In run_cycles halt-wake check:
+if cpu.halted {
+    let pending = bus.interrupt.ie & bus.interrupt.ir;
+    let wake = if cpu.intrwait_mask != 0 {
+        pending & cpu.intrwait_mask != 0
+    } else {
+        pending != 0
+    };
+    if wake { cpu.halted = false; cpu.intrwait_mask = 0; }
+}
+```
+
+That's it. ~10 lines. Same change clears the mask in the IRQ-delivery
+path in `step()` for completeness.
+
+### First attempt to do this (commit 18b39cb, reverted in 674c34c)
+
+The first attempt got distracted by trying to also model the BIOS_IF
+mirror at IWRAM `0x03007FF8` inside `handle_interrupt`. That conflicted
+with FE7's own user IRQ handler (which manages its own state) and broke
+the game. The clean version (`bb4b916`) doesn't touch BIOS_IF at all
+— it just gates the halt-wake check directly on the mask, which is the
+semantic the SWI's loop produces without needing to emulate the loop's
+implementation details.
+
+## What's kept from the rest of the session
+
+The big memory-timing investigation (Buckets A from session log: wait
+states, sequential/non-sequential tracking, cycle-accurate GamePak
+prefetch buffer) was a dead end for FE7 and caused subtle audio noise
+in Pokemon Emerald. Reverted in commit `d9b57ea`.
+
+**Kept** (independent, useful, no regressions):
+
+* The IntrWait gate itself (`bb4b916`). This is THE fix.
+* Spec-correct ARM cycle adjustments: shift-by-register +1 internal
+  cycle (`6bf339b`), PC-write +2 (`b3298b4`), IRQ entry +3 (in
+  `92f08af`). Tiny effects, individually correct.
+* All diagnostic infrastructure — env-gated, zero cost when unset:
+  - `FE7_PROBE=1` — handler / dispatch / loop / audio probes.
+  - `INSTR_TRACE_RING=1` + `TRACE_FREEZE_PC=0xADDR` — 32K-instruction
+    ring buffer with auto-dump on PC escape.
+  - `PERF_TRACE=1` — per-second fps + host busy-time + audio buffer
+    level. Diagnoses "free-running" vs "can't keep up" vs "fine".
+  - `CYCLE_PROFILE=1` — per-frame user / IRQ / halt cycle accounting.
+  - `IRQ_GATE_TRACE=1` — every write to IE / IF / IME / DISPSTAT
+    IRQ-enable bits, cycle-stamped.
+  - `TIMER_TRACE=1`, `DMA_FIRE_TRACE=1`, `DMA_IRQ_TRACE=1`,
+    `UNKNOWN_SWI_TRACE=1`, `SWI_TRACE=1`, `HALT_TRACE=1`,
+    `DUMP_PC=1`, `DMA_AUDIO_TRACE=1`.
+  - Tightened `pc_in_valid_code` (rejects VRAM mirrors that masked
+    runaway-PC bugs).
+  - Trace-ring auto-dump fires from inside `push_trace_*` rather than
+    waiting for the frontend's frame loop.
+
+**Removed** (in `d9b57ea`):
+
+* `add_mem_cycles` — reverted to a no-op stub (the API is kept so
+  read/write paths don't need to change if a future cycle-accurate
+  model wants to re-enable wait states).
+* GamePak prefetch buffer (`fetch16`/`fetch32`, `advance_prefetch`,
+  `flush_prefetch`, `rom_code_fetch`, all `pf_*` fields).
+* `recompute_rom_waits`, `reinit_wait_state_cache`, `rom_waits` table.
+* Pipeline reverted to `read16`/`read32` instead of `fetch16`/`fetch32`.
+
+## Lessons / what to remember
+
+1. **Read the engine's source code earlier.** Pokeemerald has been a
+   public decompilation for years. The decisive answer was in
+   `m4a_1.s` and `main.c` — about 30 minutes of reading. Days of
+   timing investigation could have been replaced with that.
+2. **HLE BIOS SWIs need full spec coverage** — partial implementations
+   that look like they work (the game doesn't crash on the SWI) can
+   silently break game logic in ways that only manifest indirectly
+   (here: as an audio buffer overflow several layers downstream).
+3. **Cycle accuracy is a deep iceberg**. Real-hardware-accurate wait
+   states + prefetch are a substantial subsystem with subtle
+   second-order effects (Pokemon audio noise). Don't take them on
+   without a real test bench (timer-precise test ROMs, mGBA cross-
+   reference). Functional bugs masquerade as timing bugs much more
+   often than the reverse.
+4. **The cascade pattern** (IRQ handler self-overwrite via stack
+   overflow) is FE7's symptom, not its cause. Anything that makes the
+   handler stack grow unboundedly will produce the same pattern.
+   Always trace back to "why is the handler not returning between
+   IRQs" instead of debugging the handler itself.
