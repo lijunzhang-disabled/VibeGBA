@@ -280,11 +280,31 @@ impl Cpu {
         // will be summed into bus.mem_access_cycles. We harvest below.
         let prior_mem_cycles = bus.take_mem_cycles();
         let in_irq = self.cpsr.mode() == CpuMode::Irq;
+        // PC before executing the instruction (raw, prior to pipeline advance).
+        // Used after the step to detect leaving BIOS for the IRQ-return latch.
+        let pre_pc = self.regs[15];
         let cycles = if self.cpsr.thumb() {
             self.step_thumb(bus)
         } else {
             self.step_arm(bus)
         };
+        // BIOS open-bus latch updates when leaving the HLE IRQ stub for ROM.
+        // In ARM mode, regs[15] is +8 ahead of the executing instruction, so:
+        //   • pre_pc == 0x2C → executing LDR PC,[R0,#-4] at BIOS 0x24
+        //     (dispatch into user ISR). Real BIOS would leave 0xE25EF004
+        //     (= SUBS PC, LR, #4) latched as the prefetch word at 0x13C+8.
+        //     jsmolka bios.gba test 3 reads BIOS[0] inside the user ISR.
+        //   • pre_pc == 0x34 → executing SUBS PC,LR,#4 at BIOS 0x2C
+        //     (return from IRQ). Real BIOS leaves 0xE55EC002 latched
+        //     (= LDR R12, [LR, #-2] at BIOS 0x13C+8 of the return path).
+        //     jsmolka bios.gba test 4 reads BIOS[0] after the IRQ returns.
+        if pre_pc < 0x0000_4000 && self.regs[15] >= 0x0000_4000 {
+            bus.bios_latch = match pre_pc {
+                0x2C => 0xE25E_F004,
+                0x34 => 0xE55E_C002,
+                _ => bus.bios_latch,
+            };
+        }
         let mem_cycles = bus.take_mem_cycles();
         let total = cycles + prior_mem_cycles + mem_cycles + irq_entry_cycles;
 
@@ -565,6 +585,13 @@ impl Cpu {
         // because FE7's main loop doesn't use SWI 0x05 for VBlank-sync
         // and the change didn't address the actual cascade. See debug
         // doc for details.)
+
+        // BIOS open-bus latch during IRQ. On real hardware, by the time the
+        // BIOS IRQ handler dispatches to the user ISR at [0x03FFFFFC], the
+        // last BIOS fetch leaves 0xE25EF004 (= SUBS PC, LR, #4) latched —
+        // the prefetched word at BIOS 0x134+8. jsmolka's bios.gba test 3
+        // reads BIOS[0] inside its ISR and expects this value.
+        bus.bios_latch = 0xE25E_F004;
 
         let return_addr = if self.cpsr.thumb() {
             self.regs[15] // PC is already ahead by 4 in THUMB

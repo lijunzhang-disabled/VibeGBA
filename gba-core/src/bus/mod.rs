@@ -79,8 +79,10 @@ pub struct Bus {
     pub rtc: Rtc,
     /// Open bus: last value read (for unmapped reads)
     last_read: u32,
-    /// BIOS open bus latch (protects BIOS memory)
-    bios_latch: u32,
+    /// BIOS open bus latch (protects BIOS memory). Updated naturally by
+    /// BIOS code fetches; also explicitly set on HLE SWI/IRQ to model
+    /// the prefetch words a real BIOS would leave latched.
+    pub bios_latch: u32,
     /// Whether we have a BIOS loaded
     pub has_bios: bool,
     /// Set when HALTCNT is written — CPU should halt
@@ -146,17 +148,21 @@ impl Bus {
             keypad: Keypad::new(),
             rtc,
             last_read: 0,
-            // Initial BIOS open-bus latch is 0. The latch is updated naturally
-            // each time the CPU executes BIOS code — most notably during the
-            // IRQ handler stub at BIOS 0x18, which runs every IRQ. Pokémon
-            // games run VBlankIntrWait very early, so by the time gameplay
-            // scripts execute the latch holds 0xE25EF004 (last instruction of
-            // the IRQ stub). This is what makes BPEE's `copyvar destVar,
-            // <literal_under_0x4000>` idiom work — LDRH at NULL returns the
-            // low halfword of the latch (0xF004), which becomes the value
-            // stored, so the trigger var becomes non-zero and the on-frame
-            // warphole-gate stays armed.
-            bios_latch: 0,
+            // Initial BIOS open-bus latch is 0xE129F000 (real-BIOS state right
+            // after handing control to the cartridge — prefetched word at
+            // BIOS offset 0xDC+8). The latch is also updated by handle_swi
+            // (post-SWI value 0xE3A02004) and handle_interrupt (during-IRQ
+            // value 0xE25EF004). Together these match jsmolka's bios.gba
+            // tests 1, 2 and 3. Test 4 (post-IRQ-return value 0xE55EC002)
+            // is set after the IRQ stub's SUBS PC, LR, #4 at BIOS 0x2C.
+            //
+            // Pokémon games run VBlankIntrWait very early, so by the time
+            // gameplay scripts execute the latch holds 0xE25EF004. This is
+            // what makes BPEE's `copyvar destVar, <literal_under_0x4000>`
+            // idiom work — LDRH at NULL returns the low halfword of the
+            // latch (0xF004), which becomes the value stored, so the trigger
+            // var becomes non-zero and the on-frame warphole-gate stays armed.
+            bios_latch: 0xE129_F000,
             has_bios,
             halt_requested: false,
             last_pc: 0,

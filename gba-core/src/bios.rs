@@ -72,6 +72,12 @@ pub fn handle_swi(cpu: &mut Cpu, bus: &mut Bus, comment: u8) -> bool {
             return false;
         }
     }
+    // Post-SWI BIOS open-bus value. On real hardware, after an SWI returns
+    // the bus latch holds 0xE3A02004 (= MOV R2, #4) — the prefetched word
+    // at BIOS offset 0x188+8. jsmolka's bios.gba test 2 reads BIOS[0] right
+    // after an SWI and compares against this. We don't fetch through the
+    // real BIOS on the SWI path (HLE), so set it explicitly here.
+    bus.bios_latch = 0xE3A0_2004;
     true
 }
 
