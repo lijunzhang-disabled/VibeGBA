@@ -1,6 +1,6 @@
-# VibeGBA — GBA Emulator in Rust
+# VibeGBA — An AI-Coded GBA Emulator in Rust
 
-A Game Boy Advance emulator written from scratch in Rust, with an SDL2 frontend. Built for learning — every hardware component is implemented as a Rust data structure that ticks forward in lockstep with the CPU.
+A Game Boy Advance emulator written **entirely by AI**, from scratch in Rust. Every line of code — CPU, memory bus, PPU, audio, DMA, timers, save media — was generated through AI-human pair programming, with the human providing direction and the AI writing all implementation.
 
 ```
 ┌──────────────────────────────┐
@@ -15,6 +15,12 @@ A Game Boy Advance emulator written from scratch in Rust, with an SDL2 frontend.
 │  DMA, timers, interrupts      │
 └──────────────────────────────┘
 ```
+
+## Why this exists
+
+This project is an experiment in how far AI coding can go on a complex, low-level systems task. Emulator development is traditionally considered hard — it requires deep understanding of hardware datasheets, careful bit manipulation, cycle-accurate timing, and a lot of debugging with limited feedback. VibeGBA demonstrates that AI can navigate all of these challenges when paired with a human who understands the problem domain.
+
+The entire `debug/` directory documents the AI-driven investigation and fix process for real-world compatibility bugs — each entry is a complete root-cause analysis written by AI, from symptoms through hypothesis to patch.
 
 ## Run a game
 
@@ -35,7 +41,7 @@ Controls, save-state hotkeys, BIOS info, and troubleshooting are in [`USAGE.md`]
 | [`USAGE.md`](USAGE.md) | How to build, run, and control the emulator |
 | [`PLAN.md`](PLAN.md) | Phase-by-phase implementation plan with status |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Technical deep-dive on CPU, PPU, memory bus, scheduler, audio, save states |
-| [`debug/`](debug/) | Bug investigations, [concept notes](debug/concepts/), and a rolling [followups list](debug/followups.md) |
+| [`debug/`](debug/) | AI-driven bug investigations, [concept notes](debug/concepts/), and a rolling [followups list](debug/followups.md) |
 
 ## Status
 
@@ -69,8 +75,25 @@ Drop test ROMs into `test-roms/` and run `cargo run --release --example check_te
 
 Bug investigations and the rolling list of remaining issues are in [`debug/`](debug/).
 
+## How AI built this
+
+The development followed a phased plan (documented in [`PLAN.md`](PLAN.md)), with AI generating all code across 9 phases:
+
+1. **CPU + Memory Bus** — ARM7TDMI with full ARM and THUMB instruction sets, register banking, pipeline simulation
+2. **I/O + PPU Bitmap + BIOS HLE** — Memory-mapped I/O, bitmap video modes, 22 software-emulated BIOS functions
+3. **Tile PPU + Sprites** — Text/affine backgrounds, 128 hardware sprites, OAM parsing
+4. **DMA + Timers + Input** — 4-channel DMA with FIFO/HBlank/VBlank triggers, cascading timers
+5. **Windows + Blending + Effects** — Window regions, alpha blending, brightness fade
+6. **Audio** — 4 PSG channels + 2 DMA FIFO channels, stereo mixing at 32 kHz
+7. **Saves + Save States** — SRAM, Flash (64K/128K), EEPROM auto-detection; zstd-compressed save states
+8. **Debugger** — On-demand diagnostic utilities
+9. **Accuracy polish** — Ongoing compatibility fixes, each documented with full AI-written root-cause analysis in `debug/`
+
+The `debug/` directory is particularly interesting — it contains 13+ detailed investigation reports where AI diagnosed and fixed real hardware edge cases, from pipeline refill ordering to Flash bus read semantics to BIOS open-bus latch behavior.
+
 ## Reference
 
 - [GBATEK](https://problemkaputt.de/gbatek.htm) — the definitive GBA hardware spec
 - [jsmolka test ROMs](https://github.com/jsmolka/gba-tests) — CPU instruction validation
 - [tonc](https://www.coranac.com/tonc/text/toc.htm) — GBA programming tutorial with demo ROMs
+- [emudev.org Discord Resources](https://github.com/emudev-org/discord-resources) — community-curated emulator development resources and learning materials
