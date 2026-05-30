@@ -455,9 +455,10 @@ fn main() {
                     // Metatile probe: M — dumps metatile behavior at player tile
                     // (BPEE Emerald specific; for the Granite Cave hole-vs-ladder bug).
                     sdl2::keyboard::Keycode::M => dump_metatile_at_player(&gba),
-                    // Map script table: S — walks gMapHeader.mapScripts and dumps
+                    // Map script table: P — walks gMapHeader.mapScripts and dumps
                     // ON_FRAME_TABLE / ON_WARP_INTO_MAP_TABLE var/value/script triples.
-                    sdl2::keyboard::Keycode::S => dump_map_scripts(&gba),
+                    // (Was S; moved to P because S is the GBA R button.)
+                    sdl2::keyboard::Keycode::P => dump_map_scripts(&gba),
                     // Vars probe: V — dumps the values of game vars around 0x4022
                     // (the var that gates the auto-warp on Map 2).
                     sdl2::keyboard::Keycode::V => dump_vars(&gba),
