@@ -1,6 +1,6 @@
 # VibeGBA — An AI-Coded GBA Emulator in Rust
 
-A Game Boy Advance emulator written **entirely by AI**, from scratch in Rust. Every line of code — CPU, memory bus, PPU, audio, DMA, timers, save media — was generated through AI-human pair programming, with the human providing direction and the AI writing all implementation.
+A Game Boy Advance emulator built from scratch in Rust, largely written through AI-human pair programming. The human steered the direction and made design calls; the AI handled most of the implementation — CPU, memory bus, PPU, audio, DMA, timers, save media, and so on.
 
 ```
 ┌──────────────────────────────┐
@@ -18,9 +18,9 @@ A Game Boy Advance emulator written **entirely by AI**, from scratch in Rust. Ev
 
 ## Why this exists
 
-This project is an experiment in how far AI coding can go on a complex, low-level systems task. Emulator development is traditionally considered hard — it requires deep understanding of hardware datasheets, careful bit manipulation, cycle-accurate timing, and a lot of debugging with limited feedback. VibeGBA demonstrates that AI can navigate all of these challenges when paired with a human who understands the problem domain.
+This started as an experiment to see how well AI coding holds up on a complex, low-level systems task. Emulator development involves hardware datasheets, fiddly bit manipulation, timing-sensitive logic, and lots of debugging with limited feedback — a good stress test. It turned out to work reasonably well, though plenty of human guidance was needed along the way.
 
-The entire `debug/` directory documents the AI-driven investigation and fix process for real-world compatibility bugs — each entry is a complete root-cause analysis written by AI, from symptoms through hypothesis to patch.
+The `debug/` directory documents the investigation and fix process for real-world compatibility bugs — each entry walks through symptoms, hypotheses, and the eventual patch.
 
 ## Run a game
 
@@ -41,7 +41,7 @@ Controls, save-state hotkeys, BIOS info, and troubleshooting are in [`USAGE.md`]
 | [`USAGE.md`](USAGE.md) | How to build, run, and control the emulator |
 | [`PLAN.md`](PLAN.md) | Phase-by-phase implementation plan with status |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Technical deep-dive on CPU, PPU, memory bus, scheduler, audio, save states |
-| [`debug/`](debug/) | AI-driven bug investigations, [concept notes](debug/concepts/), and a rolling [followups list](debug/followups.md) |
+| [`debug/`](debug/) | Bug investigations, [concept notes](debug/concepts/), and a rolling [followups list](debug/followups.md) |
 
 ## Status
 
@@ -75,9 +75,9 @@ Drop test ROMs into `test-roms/` and run `cargo run --release --example check_te
 
 Bug investigations and the rolling list of remaining issues are in [`debug/`](debug/).
 
-## How AI built this
+## How it was built
 
-The development followed a phased plan (documented in [`PLAN.md`](PLAN.md)), with AI generating all code across 9 phases:
+Development followed a phased plan (documented in [`PLAN.md`](PLAN.md)). AI generated the bulk of the code, with human review and course-correction throughout:
 
 1. **CPU + Memory Bus** — ARM7TDMI with full ARM and THUMB instruction sets, register banking, pipeline simulation
 2. **I/O + PPU Bitmap + BIOS HLE** — Memory-mapped I/O, bitmap video modes, 22 software-emulated BIOS functions
@@ -87,9 +87,9 @@ The development followed a phased plan (documented in [`PLAN.md`](PLAN.md)), wit
 6. **Audio** — 4 PSG channels + 2 DMA FIFO channels, stereo mixing at 32 kHz
 7. **Saves + Save States** — SRAM, Flash (64K/128K), EEPROM auto-detection; zstd-compressed save states
 8. **Debugger** — On-demand diagnostic utilities
-9. **Accuracy polish** — Ongoing compatibility fixes, each documented with full AI-written root-cause analysis in `debug/`
+9. **Accuracy polish** — Ongoing compatibility fixes, each documented with root-cause analysis in `debug/`
 
-The `debug/` directory is particularly interesting — it contains 13+ detailed investigation reports where AI diagnosed and fixed real hardware edge cases, from pipeline refill ordering to Flash bus read semantics to BIOS open-bus latch behavior.
+The `debug/` directory contains 13+ investigation reports covering real hardware edge cases — pipeline refill ordering, Flash bus read semantics, BIOS open-bus latch behavior, and more.
 
 ## Reference
 
