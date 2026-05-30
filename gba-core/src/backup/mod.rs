@@ -61,7 +61,10 @@ impl BackupMedia {
 pub fn detect_backup_type(rom: &[u8]) -> BackupMedia {
     let rom_str = String::from_utf8_lossy(rom);
 
-    if rom_str.contains("SRAM_V") {
+    // SRAM_V<ver> is the standard SRAM signature. SRAM_F_V<ver> is the FRAM
+    // variant used by some games (e.g. Fire Emblem 7) — functionally
+    // identical 32KB SRAM-mapped save storage at 0x0E00_0000.
+    if rom_str.contains("SRAM_V") || rom_str.contains("SRAM_F_V") {
         BackupMedia::Sram(sram::Sram::new())
     } else if rom_str.contains("FLASH1M_V") {
         BackupMedia::Flash(flash::Flash::new_with_rom(128 * 1024, Some(rom)))
