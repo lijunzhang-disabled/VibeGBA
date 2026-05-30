@@ -1,9 +1,0 @@
-   Compiling gba-core v0.1.0 (/Users/lijunzhang/secagentinfra/gba/gba-core)
-   Compiling gba-frontend v0.1.0 (/Users/lijunzhang/secagentinfra/gba/gba-frontend)
-    Finished `release` profile [optimized] target(s) in 1.83s
-     Running `target/release/gba-frontend /Users/lijunzhang/Documents/PokemonEmeraldVersion.gba`
-Loaded save from /Users/lijunzhang/Documents/PokemonEmeraldVersion.sav
-SDL2 renderer: software (flags: 0xD)
-SDL2 audio: requested freq=48000 samples=1024, obtained freq=48000 Hz, channels=2, samples=1024, format=S16LSB
-WARP CMD-THUMB pc=0809A35C lr=08098D87 r0=03000EB8 r1=0809A35D r2=0822DC70 r3=0809D88D scriptPtr=0822DC71 bytes=[18 09 FF] scratch=(255,255,FF) active=(24,8,01) curMap=(4,0) playerXY=(24,18)
-WARP WRAP-THUMB pc=08084E80 lr=0809A3CB r0=00000018 r1=00000009 r2=FFFFFFFF r3=00000000 scriptPtr=E28FE000 bytes=[00 00 00] scratch=(255,255,FF) active=(24,8,01) curMap=(4,0) playerXY=(24,18)

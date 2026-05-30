@@ -19,3 +19,9 @@ test-roms/*.bin
 
 # Claude Code local settings (per-machine permissions, etc.)
 .claude/settings.local.json
+
+# Antigravity CLI local state
+.antigravitycli/
+
+# Warp terminal logs
+warp.log
