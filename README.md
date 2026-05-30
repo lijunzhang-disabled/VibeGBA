@@ -41,9 +41,33 @@ Controls, save-state hotkeys, BIOS info, and troubleshooting are in [`USAGE.md`]
 
 - Phases 1-7 (CPU, memory, PPU, DMA, timers, audio, saves) — **Done**
 - Phase 8 (debugger) — optional, small utilities added on demand
-- Phase 9 (accuracy polish) — ongoing; recent: Pokémon Emerald boots to title screen with music, in-game save round-trips correctly, jsmolka arm/thumb/memory test ROMs all pass; current active bug is FE7 HBlank/audio gate behavior
+- Phase 9 (accuracy polish) — ongoing
 
 90 checked-in unit tests, ~10,000 lines of Rust across `gba-core` and `gba-frontend`.
+
+### Test ROM compatibility
+
+[jsmolka's GBA test suite](https://github.com/jsmolka/gba-tests) — all four ROMs pass end-to-end:
+
+| ROM            | Status |
+|----------------|--------|
+| `arm.gba`      | ✅ ALL PASS |
+| `thumb.gba`    | ✅ ALL PASS |
+| `memory.gba`   | ✅ ALL PASS |
+| `bios.gba`     | ✅ ALL PASS |
+
+Drop test ROMs into `test-roms/` and run `cargo run --release --example check_test -- test-roms/<rom>.gba` to verify on your machine. The runner detects "All tests passed" by checking the mode-4 framebuffer where the test framework renders its result.
+
+### Playable games (spot-tested)
+
+| Game                                  | Status |
+|---------------------------------------|--------|
+| Pokémon Emerald (US)                  | Title screen, in-game music, save/load round-trip, PokéNav map all work |
+| Fire Emblem 7 (US)                    | Boots to title, save (.sav) works, resume option appears after saving |
+| Super Robot Taisen: Original Generation | Playable |
+| Golden Sun                            | Playable |
+
+Bug investigations and the rolling list of remaining issues are in [`debug/`](debug/).
 
 ## Reference
 
