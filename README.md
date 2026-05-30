@@ -62,6 +62,15 @@ Controls, save-state hotkeys, BIOS info, and troubleshooting are in [`USAGE.md`]
 | `memory.gba`   | ✅ ALL PASS |
 | `bios.gba`     | ✅ ALL PASS |
 
+[Emu-Docs test ROMs](https://github.com/emudev-org/discord-resources) — CPU, audio, and graphics tests:
+
+| Test Suite | ROMs | Status |
+|------------|------|--------|
+| CPUTest (Deadbody) | `CPUTest.gba` | ✅ ALL PASS |
+| ARM Wrestler (Mic/NORMATT) | `armwrestler.gba` | ✅ ALL PASS |
+| Belogic Sound Tests | `soundtest1-4.gba`, `sound3demorom.gba`, `directsoundrom.gba` (5 ROMs) | ✅ All boot, render UI, audio plays correctly |
+| Tonc GBA Demos (Jasper Vijn) | 34 demo ROMs covering BG modes, sprites, affine, blending, windows, DMA, timers, IRQ, SWI, text rendering | ✅ All 34 boot and render correctly |
+
 Drop test ROMs into `test-roms/` and run `cargo run --release --example check_test -- test-roms/<rom>.gba` to verify on your machine. The runner detects "All tests passed" by checking the mode-4 framebuffer where the test framework renders its result.
 
 ### Playable games (spot-tested)
