@@ -232,3 +232,42 @@ cycle-accuracy when the real issue was a broken SWI contract.
 
 See: `debug/2026-05-24_fe7-hblank-irq-cascade.md` for the full
 investigation log.
+
+## Re-framing the FE7 bug from the scheduler's perspective
+
+(See [`scheduler.md`](scheduler.md) for the scheduler/wake-gate model.)
+
+It's tempting to summarise the FE7 bug as "the CPU shouldn't take the
+HBlank interrupts." That's slightly off. The HBlank IRQs are real and
+intended — FE7 enables them for raster effects, the IRQ handler runs,
+does its raster work, and returns. None of that is the bug.
+
+The bug is one layer up. After the IRQ handler returns, the CPU was
+supposed to stay **halted** (because FE7 called `VBlankIntrWait`,
+meaning "wake me only for VBlank"). Our wake-gate didn't know about
+the mask, so it treated *any* pending IRQ as a wake signal. So instead
+of re-halting after the HBlank handler, the CPU fell through to FE7's
+main loop body — running the audio mixer and game logic ~160× per
+frame instead of once.
+
+Said in scheduler-loop terms:
+
+- The scheduler ran every frame the same way regardless: HBlank →
+  HBlankEnd → HBlank → … → VBlank, ~320 events between two consecutive
+  `VBlankIntrWait` calls. All on time. All firing the right IRQ bits
+  in `IF`.
+- The CPU was in halt-mode, so the inner loop fast-forwarded
+  `timestamp` between events instead of stepping instructions. That
+  also worked correctly.
+- The **wake-gate** was the single point of failure. It saw
+  `IE & IF != 0` on every HBlank and cleared `cpu.halted`, even though
+  `intrwait_mask` said "VBlank only."
+
+The fix doesn't change the scheduler, doesn't change event handling,
+doesn't change IRQ delivery. It changes one condition in the wake-gate:
+`pending != 0` → `pending & mask != 0`. That single filter turns 159
+correct-but-unwanted wake signals back into a single VBlank wake — the
+semantic the real BIOS achieves with its `HALT; check IF; loop` block.
+
+The CPU isn't ignoring HBlank IRQs. It's running the handler, then
+going back to sleep — which is what the mask is for.

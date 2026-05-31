@@ -164,3 +164,46 @@ Picture the CPU as a runner and the scheduler as a meeting schedule:
 > "The runner sprints until the next meeting on the calendar. At the meeting, the hardware does its thing, schedules its next meeting, and the runner goes again."
 
 The runner never stops to ask "is there a meeting yet?" — the calendar answers that question once, at the start of each sprint.
+
+## What happens when the CPU halts
+
+When the game executes `SWI Halt` or `SWI VBlankIntrWait`, the CPU
+stops being the cycle-consumer. But the scheduler keeps running — PPU,
+DMA, timers, audio all need to advance independently of the CPU.
+
+The inner `while timestamp < step_target` loop in `lib.rs:287` has two
+branches:
+
+```rust
+if self.cpu.halted {
+    // fast-forward timestamp to step_target,
+    // ticking APU + timers in sub-chunks
+    break;
+}
+let cycles = self.cpu.step(&mut self.bus);
+self.scheduler.add_cycles(cycles);
+```
+
+So the loop structure is the same in both modes — peek next event, run
+until it, fire it, repeat. Halt just changes *who burns the cycles*:
+the CPU executing instructions, or a direct timestamp jump.
+
+After every event fires, a **wake-gate** checks whether any pending
+IRQ should unhalt the CPU:
+
+```rust
+if self.cpu.halted {
+    let pending = self.bus.interrupt.ie & self.bus.interrupt.ir;
+    let mask = self.cpu.intrwait_mask;
+    let wake = if mask != 0 { pending & mask != 0 } else { pending != 0 };
+    if wake { self.cpu.halted = false; ... }
+}
+```
+
+The scheduler doesn't know or care about halt — it just keeps firing
+events on time. Event handlers post IRQ bits to `IF` as usual. The
+wake-gate is the **only** thing that converts a scheduler-posted IRQ
+back into CPU execution.
+
+See [`swi-halt-intrwait.md`](swi-halt-intrwait.md) for the SWI
+semantics and the FE7 bug that came from getting this gate wrong.
