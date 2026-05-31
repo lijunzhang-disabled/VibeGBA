@@ -15,6 +15,7 @@ Each file is one self-contained topic. Add a new file when you find yourself re-
 | Timers — counter/reload/prescaler/cascade, what "overflow" means, how it generates audio sample clocks and frame timing | [timers.md](timers.md) |
 | DMA register model — SAD/DAD/FIFO meaning, the two-register pattern (`sad` vs `internal_sad`), and why GBA DMA looks primitive next to modern queue-based DMA | [dma-registers.md](dma-registers.md) |
 | DirectSound FIFO DMA + the VBlank reset hook | [fifo-dma-vblank.md](fifo-dma-vblank.md) |
+| SWI dispatch, halt mode, and the IntrWait re-halt gate — how games sleep, why only matching IRQs should wake IntrWait, and the FE7 bug | [swi-halt-intrwait.md](swi-halt-intrwait.md) |
 
 ## Style
 

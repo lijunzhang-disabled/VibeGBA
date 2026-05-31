@@ -35,6 +35,7 @@ See [concepts/README.md](concepts/README.md) for the full index. Current topics:
 - [timers](concepts/timers.md) — counter/reload/prescaler/cascade, what overflow means, how audio sample rates are generated.
 - [dma-registers](concepts/dma-registers.md) — SAD/DAD/FIFO meaning, two-register pattern, contrast with modern queue-based DMA.
 - [fifo-dma-vblank](concepts/fifo-dma-vblank.md) — DirectSound FIFO DMA and the VBlank reset hook.
+- [swi-halt-intrwait](concepts/swi-halt-intrwait.md) — SWI dispatch, halt mode, and the IntrWait re-halt gate (including the FE7 bug).
 
 ## Template
 
