@@ -4,7 +4,7 @@ Tracking known issues, accuracy gaps, and "we'll get to it later" items
 across the emulator. Per-bug investigation logs go in dated files; this is
 the rolling list of things still worth doing.
 
-Last reviewed: **2026-05-27** (docs synced with current FE7/wait-state status).
+Last reviewed: **2026-05-30** (synced with FE7 fix, BIOS latch fix, wait-state revert).
 
 ## ✅ RESOLVED: Pokémon Emerald save flakiness (commit b29226f)
 
@@ -33,21 +33,34 @@ not sufficient — both fixes are needed for round-trip saves to work.
 
 ---
 
+## ✅ RESOLVED: Fire Emblem 7 — HBlank/audio gate cascade (commit bb4b916)
+
+Root cause: HLE SWI 0x04/0x05 (`IntrWait`/`VBlankIntrWait`) set
+`cpu.halted = true` and let *any* pending IRQ wake the CPU. Real BIOS
+implements a halt-then-recheck loop that re-halts on non-matching IRQs.
+Without the gate, HBlank IRQs (159/frame) woke FE7's `WaitForVBlank`
+prematurely → main loop ran 3.5×/frame → M4A audio engine overflowed
+its 192-slot channel buffer at IWRAM 0x2930 → corrupted IRQ handler at
+0x03003950 → cascade freeze.
+
+Fix (~10 lines): new `cpu.intrwait_mask` field set by SWI 0x04/0x05;
+halt-wake check gated so only a matching IRQ clears `halted`.
+
+The wait-state/prefetch-buffer investigation that ran alongside this
+(parts 1–12 of the debug doc) turned out to be a dead end and was
+reverted in commit `d9b57ea`. See `debug/2026-05-24_fe7-hblank-irq-cascade.md`.
+
+---
+
+## ✅ RESOLVED: `bios.gba` test 001 — BIOS stale-bus latch (commit db9aaf8)
+
+Previously listed as item 3. The HLE BIOS now primes `bios_latch` at
+startup (0xE129F000), after SWI (0xE3A02004), and during IRQ
+(0xE25EF004). All four jsmolka `bios.gba` latch tests now pass.
+
+---
+
 ## High priority — known correctness bugs
-
-### 0. Fire Emblem 7 — HBlank/audio gate cascade
-Status: open; see `debug/2026-05-24_fe7-hblank-irq-cascade.md`.
-
-FE7 boots into the intro, then eventually corrupts its IRQ handler after
-the audio engine over-runs an IWRAM state table. The latest lead is not
-DMA1/Timer0 correctness: those were traced and looked healthy. The audio
-engine main at `0x0801529C` fires about 8.7 times per frame instead of
-about once, usually at a 2-scanline cadence. The immediate gate is the
-EWRAM word at `0x02024C70`.
-
-Next step: find every writer of `0x02024C70`, then verify why it remains
-non-zero across HBlank wakeups in our emulator. Workaround for exploring
-the rest of FE7: `DISABLE_HBLANK_IRQ=1`.
 
 ### 1. Super Robot Taisen: Original Generation — visuals + most audio fixed; residual
 Status: visual path fixed (chip ID, see
@@ -77,26 +90,19 @@ Next time: identify *which* code path Pokémon takes that depends on the
 write being dropped, OR figure out what the hang's root cause is.
 Reads are correct (8-bit broadcast, fixed in 64b04c0).
 
-### 3. `bios.gba` test 001 — BIOS stale-bus latch
-Status: known-failing  
-Test reads from address 0 outside BIOS context and expects the last
-BIOS-fetched instruction (`0xE129F000`) to be returned (open-bus latch).
-Our HLE BIOS doesn't naturally produce this latched value. Narrow fix:
-hardcode the canonical latch value when `read32(0x0)` is called outside
-BIOS execution. Doesn't affect any real game.
-
 ## Medium priority — accuracy gaps
 
 ### 4. Wait state / prefetch accuracy
-Status: partially modelled
-`bus::add_mem_cycles` now charges EWRAM, palette/VRAM, and ROM wait
-states using WAITCNT N/S timing. This fixed at least one FE7 timing
-class, so the old "every memory access takes 1 cycle" note is obsolete.
-
-Remaining gap: the Game Pak prefetch buffer is not cycle-accurate. The
-current code deliberately charges sequential ROM access at full S-wait
-rather than modelling buffer fill/drain per cycle. That is good enough
-for current investigations but can diverge for tight ROM loops.
+Status: **not modelled** (reverted)
+The per-region wait-state model and GamePak prefetch buffer added during
+the FE7 investigation caused subtle audio-timing regressions in Pokémon
+Emerald without fixing the actual bug (which was a missing IntrWait
+re-halt, not a timing gap). All that code was **reverted in commit
+`d9b57ea`** (2026-05-29). `bus::add_mem_cycles` is currently a no-op
+stub; every memory access effectively takes 1 cycle. The API surface is
+kept so a future cycle-accurate model can slot in without touching every
+call site. Low risk for game compat — most commercial games are
+tolerant of timing inaccuracy.
 
 ### 5. Open-bus read accuracy
 Status: simplified  
@@ -116,7 +122,7 @@ review against the ARM ARM spec.
 ## Low priority — wide-coverage / nice-to-have
 
 ### 7. Missing BIOS SWIs
-Status: ~22 of ~40 SWIs implemented (see header comment in
+Status: ~23 of ~40 SWIs implemented (see header comment in
 `gba-core/src/bios.rs`).  
 Notable missing ones:
 - `0x19 SoundBias` (audio gain ramping)

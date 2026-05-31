@@ -18,7 +18,7 @@ Building a GBA (Game Boy Advance) emulator from scratch in Rust. Scanline-accura
 | Phase 8: Debugger | **Optional** — add small utilities on demand | — |
 | Phase 9: Accuracy Polish | In progress (compatibility + timing polish) | Ongoing |
 
-**Total: 90 checked-in unit tests, ~10,000 lines of Rust (core + frontend)**
+**Total: 115 checked-in unit tests, ~11,500 lines of Rust (core + frontend)**
 
 ### Phase 9 progress so far (see `debug/` for details)
 
@@ -33,7 +33,7 @@ Building a GBA (Game Boy Advance) emulator from scratch in Rust. Scanline-accura
 | Pokémon Emerald BIOS/open-bus edge case | Track BIOS latch for HLE IRQ stub/open-bus reads | [2026-05-23](debug/2026-05-23_pokemon-emerald-bios-open-bus.md) |
 | HBlank DMA during VBlank | Gate HBlank DMA to visible lines only | [2026-05-19](debug/2026-05-19_pokemon-hblank-dma-vblank.md) |
 | SRTOG FIFO cross-trigger | Refill only the FIFO whose DMA destination matches the low FIFO | [2026-05-05](debug/2026-05-05_srtog-fifo-b-cross-trigger.md) |
-| FE7 HBlank/audio cascade | Still open; gate variable at `0x02024C70` is the next lead | [2026-05-24](debug/2026-05-24_fe7-hblank-irq-cascade.md) |
+| FE7 HBlank/audio cascade | Fixed — IntrWait HLE re-halt gate (commit `bb4b916`) | [2026-05-24](debug/2026-05-24_fe7-hblank-irq-cascade.md) |
 
 ## GBA Hardware Summary
 
@@ -98,7 +98,7 @@ Building a GBA (Game Boy Advance) emulator from scratch in Rust. Scanline-accura
 **Goal**: Boot a ROM without a BIOS dump, render bitmap frames to SDL2.
 
 **What was built:**
-- **BIOS HLE** (`bios.rs`, ~450 lines): implements 22 SWI functions in Rust so no BIOS dump is needed:
+- **BIOS HLE** (`bios.rs`, ~450 lines): implements 23 SWI functions in Rust so no BIOS dump is needed:
   - **Math**: Div, DivArm, Sqrt, ArcTan, ArcTan2
   - **Memory**: CpuSet, CpuFastSet (copy/fill in 16-bit and 32-bit modes)
   - **Decompression**: LZ77UnCompWram/Vram, HuffmanUnComp, RLUnCompWram/Vram, BitUnPack
@@ -350,12 +350,12 @@ SDL2 audio callback (~60x per second):
 **Goal**: Maximize game compatibility.
 
 **General:**
-- WAITCNT wait states are implemented for EWRAM, VRAM/palette, and ROM N/S timing; Game Pak prefetch is still approximated rather than cycle-accurate.
+- WAITCNT wait states were implemented but later reverted (commit `d9b57ea`) due to audio regressions in Pokémon Emerald; `add_mem_cycles` is currently a no-op stub. The API surface is kept for future re-enablement.
 - Open bus behavior and BIOS read protection are implemented enough for known games, but not hardware-complete.
 - Misaligned access quirks are partially implemented and still worth review.
 - Forced blank, HBlank interval free, sprite/window/effect edge cases, and broad commercial game testing remain accuracy-polish work.
 
-**BIOS HLE — incomplete (22 of ~40 SWIs implemented):**
+**BIOS HLE — incomplete (23 of ~40 SWIs implemented):**
 
 Currently missing SWIs (games that use them won't work correctly without a real BIOS dump):
 
@@ -365,7 +365,6 @@ Currently missing SWIs (games that use them won't work correctly without a real 
 | 0x1A | SoundDriverInit | Initializes the M4A sound driver |
 | 0x1B | SoundDriverMode | Sets sound mixer mode |
 | 0x1C | SoundDriverMain | Main mixer tick (per frame) |
-| 0x1D | SoundDriverVSync | VBlank sync for audio |
 | 0x1E | SoundChannelClear | Clears all sound channels |
 | 0x1F | MidiKey2Freq | Converts MIDI note to GBA frequency register value |
 | 0x20 | MusicPlayerOpen | Open music player slot |
@@ -385,7 +384,7 @@ Implementation note: SWIs that are unhandled currently just log a warning and re
 Workaround: load a real GBA BIOS dump via `--bios gba_bios.bin` for games that depend on missing BIOS services. Pokémon Emerald and FE7 ship their own audio engines, so a real BIOS is not expected to fix their audio/timing bugs.
 
 **Known game-specific issues** (tracked in `debug/` folder):
-- Fire Emblem 7 intro can cascade through HBlank/audio wakeups and corrupt its IRQ handler; current lead is the audio gate variable at `0x02024C70`.
+- Fire Emblem 7 HBlank cascade — **fixed** via IntrWait re-halt gate (commit `bb4b916`). See `debug/2026-05-24_fe7-hblank-irq-cascade.md`.
 - SRTOG has residual audio distortion after the major FIFO cross-trigger fix.
 - Pokémon Emerald RTC — **fixed** via S-3511 HLE in `rtc.rs`
 
@@ -400,7 +399,7 @@ gba/
 ├── ARCHITECTURE.md               # Technical architecture deep-dive
 ├── .gitignore
 │
-├── gba-core/                     # Library crate (~5600 lines)
+├── gba-core/                     # Library crate (~10,500 lines)
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs                # Gba struct, run_frame(), scanline loop
@@ -410,7 +409,7 @@ gba/
 │       │   ├── thumb.rs          # THUMB instruction decoder + executor
 │       │   ├── alu.rs            # Barrel shifter, ALU ops, flag calculation
 │       │   └── disasm.rs         # Disassembler (stub, Phase 8)
-│       ├── bios.rs               # BIOS HLE — 22 SWI functions in Rust
+│       ├── bios.rs               # BIOS HLE — 23 SWI functions in Rust
 │       ├── bus/
 │       │   ├── mod.rs            # Bus struct, memory map, read/write dispatch
 │       │   └── io_regs.rs        # I/O register read/write (0x04000000)
@@ -435,7 +434,7 @@ gba/
 │           ├── flash.rs          # Flash (64KB/128KB, command state machine)
 │           └── eeprom.rs         # EEPROM (512B/8KB, serial bit-bang protocol)
 │
-├── gba-frontend/                 # Binary crate (~190 lines)
+├── gba-frontend/                 # Binary crate (~950 lines)
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs               # Entry point, arg parsing, main loop

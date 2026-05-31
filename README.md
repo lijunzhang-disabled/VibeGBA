@@ -49,7 +49,7 @@ Controls, save-state hotkeys, BIOS info, and troubleshooting are in [`USAGE.md`]
 - Phase 8 (debugger) — optional, small utilities added on demand
 - Phase 9 (accuracy polish) — ongoing
 
-90 checked-in unit tests, ~10,000 lines of Rust across `gba-core` and `gba-frontend`.
+115 checked-in unit tests, ~11,500 lines of Rust across `gba-core` and `gba-frontend`.
 
 ### Test ROM compatibility
 
@@ -78,7 +78,7 @@ Drop test ROMs into `test-roms/` and run `cargo run --release --example check_te
 | Game                                  | Status |
 |---------------------------------------|--------|
 | Pokémon Emerald (US)                  | Title screen, in-game music, save/load round-trip, PokéNav map all work |
-| Fire Emblem 7 (US)                    | Boots to title, save (.sav) works, resume option appears after saving |
+| Fire Emblem 7 (US)                    | Playable — intro, gameplay, save/load all work |
 | Super Robot Taisen: Original Generation | Playable |
 | Golden Sun                            | Playable |
 

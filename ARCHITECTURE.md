@@ -24,7 +24,7 @@
 │                  │  └─────┘ └──────┘ └───────┘  │    │
 │  ┌──────────┐    │                               │    │
 │  │BIOS HLE │    │  ┌──────┐ ┌──────┐ ┌───────┐  │    │
-│  │(22 SWIs)│    │  │Timers│ │Keypad│ │ IRQ   │  │    │
+│  │(23 SWIs)│    │  │Timers│ │Keypad│ │ IRQ   │  │    │
 │  └──────────┘    │  └──────┘ └──────┘ └───────┘  │    │
 │                  │                               │    │
 │                  │  ┌──────────┐ ┌────────────┐  │    │
@@ -372,7 +372,7 @@ The `BinaryHeap` is a max-heap by default, so we reverse the `Ord` implementatio
 
 ## BIOS High-Level Emulation
 
-When no BIOS dump is provided, 22 SWI functions are emulated in Rust:
+When no BIOS dump is provided, 23 SWI functions are emulated in Rust:
 
 | SWI | Name | What It Does |
 |---|---|---|
@@ -398,6 +398,7 @@ When no BIOS dump is provided, 22 SWI functions are emulated in Rust:
 | 0x13 | HuffUnComp | Huffman decompression |
 | 0x14 | RLUnCompWram | Run-length decompression to WRAM |
 | 0x15 | RLUnCompVram | Run-length decompression to VRAM |
+| 0x1D | SoundDriverVSync | Sets timer reload for sound mixer sync |
 
 ## DMA (Direct Memory Access)
 
@@ -687,7 +688,7 @@ Gba::load_state(data)
       → *self = state            // Exact restoration of all emulator state
 ```
 
-Hotkeys: **F5** = save state, **F8** = load state.
+Hotkeys: **]** = save state, **[** = load state.
 
 ### What's serialized
 
@@ -704,20 +705,20 @@ Every field in the `Gba` struct is captured:
 ## Crate Separation
 
 ```
-gba-core (library, ~8200 lines)
+gba-core (library, ~9500 lines)
 ├── Pure emulation logic
 ├── No platform dependencies (no SDL2, no filesystem)
 ├── All state serializable via serde
 └── Usable by any frontend (SDL2, WASM, headless testing)
 
-gba-frontend (binary, ~385 lines)
+gba-frontend (binary, ~550 lines)
 ├── SDL2 window management (240×160 scaled with configurable factor)
 ├── 15-bit GBA color → 24-bit RGB conversion
 ├── Keyboard input mapping (Z=A, X=B, arrows=dpad, A/S=L/R)
 ├── Frame timing (~59.737 Hz via sleep)
-├── Audio output (planned)
-├── Debugger CLI (planned)
-└── Save file I/O (planned)
+├── Audio output (32768 Hz stereo via SDL2 callback)
+├── Diagnostic hotkeys (env-gated debug probes)
+└── Save file I/O (.sav auto-load/save, .state with zstd compression)
 ```
 
 This separation means the emulator core could be compiled to WASM with a web frontend, or run headless for automated testing, without changing any core code.

@@ -11,7 +11,7 @@
 //!
 //! ## Coverage
 //!
-//! We HLE 22 of ~40 GBA BIOS SWIs. The missing ones are mostly sound-related
+//! We HLE 23 of ~40 GBA BIOS SWIs. The missing ones are mostly sound-related
 //! (SWI 0x19-0x1F), music player (0x20-0x24), MultiBoot (0x25), and a handful
 //! of undocumented/rarely-used calls (0x26-0x2A).
 //!

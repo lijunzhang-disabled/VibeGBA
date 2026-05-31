@@ -198,7 +198,7 @@ gba/
 │       ├── apu/       # Audio: PSG channels, FIFO, mixer
 │       ├── dma.rs     # DMA transfer controller
 │       ├── timer.rs   # 4 hardware timers
-│       ├── bios.rs    # BIOS HLE (22 SWI functions)
+│       ├── bios.rs    # BIOS HLE (23 SWI functions)
 │       └── backup/    # Save media (SRAM, Flash, EEPROM)
 │
 ├── gba-frontend/      # SDL2 frontend

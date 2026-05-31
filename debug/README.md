@@ -22,7 +22,7 @@ This folder stores three kinds of documents:
 | 2026-05-05 | [SRTOG FIFO_B cross-trigger](2026-05-05_srtog-fifo-b-cross-trigger.md) | **Fixed** |
 | 2026-05-19 | [Pokémon HBlank DMA during VBlank](2026-05-19_pokemon-hblank-dma-vblank.md) | **Fixed** |
 | 2026-05-23 | [Pokémon Emerald BIOS open-bus latch](2026-05-23_pokemon-emerald-bios-open-bus.md) | **Fixed** |
-| 2026-05-24 | [FE7 HBlank/audio IRQ cascade](2026-05-24_fe7-hblank-irq-cascade.md) | **Open** |
+| 2026-05-24 | [FE7 HBlank/audio IRQ cascade](2026-05-24_fe7-hblank-irq-cascade.md) | **Fixed** |
 
 ## Concept notes
 
