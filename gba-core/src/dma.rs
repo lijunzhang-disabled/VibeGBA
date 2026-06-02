@@ -39,6 +39,13 @@ pub struct DmaChannel {
     /// whether FIFO DMAs fire at the expected rate.
     #[serde(default, skip)]
     pub run_count: u64,
+    /// Scheduler timestamp at which `internal_sad` was last latched (i.e.,
+    /// the most recent 0→1 transition of the enable bit). Used by the
+    /// VBlank FIFO-DMA re-anchor to distinguish games that drive their
+    /// own DMA refresh (like velipso's timer-IRQ buffer swap) from games
+    /// that don't (like Pokémon Emerald). See [[fifo-dma-vblank]].
+    #[serde(default)]
+    pub last_latch_cycle: u64,
 }
 
 impl DmaChannel {
@@ -53,6 +60,7 @@ impl DmaChannel {
             internal_count: 0,
             active: false,
             run_count: 0,
+            last_latch_cycle: 0,
         }
     }
 
@@ -176,8 +184,10 @@ impl DmaController {
 
     /// Write to a DMA channel's control register.
     /// Handles the enable-bit 0→1 transition (latch addresses + fire immediate).
+    /// `now` is the scheduler timestamp at the write — recorded on each
+    /// 0→1 latch and consulted by the VBlank FIFO re-anchor.
     /// Returns Some(channel_id) if an immediate DMA should run now.
-    pub fn write_control(&mut self, channel_id: usize, value: u16) -> Option<usize> {
+    pub fn write_control(&mut self, channel_id: usize, value: u16, now: u64) -> Option<usize> {
         let old_enabled = self.channels[channel_id].enabled();
         self.channels[channel_id].control = value;
         let new_enabled = self.channels[channel_id].enabled();
@@ -186,6 +196,7 @@ impl DmaController {
             // Enable bit went 0→1: latch addresses
             self.channels[channel_id].latch(channel_id);
             self.channels[channel_id].active = true;
+            self.channels[channel_id].last_latch_cycle = now;
 
             if self.channels[channel_id].timing() == DmaTiming::Immediate {
                 return Some(channel_id);
@@ -332,7 +343,7 @@ mod tests {
         dma.channels[3].count = 100;
 
         // Enable with immediate timing
-        let result = dma.write_control(3, 1 << 15); // Enable, immediate
+        let result = dma.write_control(3, 1 << 15, 0); // Enable, immediate
         assert_eq!(result, Some(3));
         assert_eq!(dma.channels[3].internal_sad, 0x0800_0000);
         assert_eq!(dma.channels[3].internal_dad, 0x0600_0000);
@@ -343,11 +354,11 @@ mod tests {
     fn test_dma_count_zero_means_max() {
         let mut dma = DmaController::new();
         dma.channels[0].count = 0;
-        let _ = dma.write_control(0, 1 << 15);
+        let _ = dma.write_control(0, 1 << 15, 0);
         assert_eq!(dma.channels[0].internal_count, 0x4000); // DMA0 max
 
         dma.channels[3].count = 0;
-        let _ = dma.write_control(3, 1 << 15);
+        let _ = dma.write_control(3, 1 << 15, 0);
         assert_eq!(dma.channels[3].internal_count, 0x10000); // DMA3 max
     }
 
@@ -368,13 +379,13 @@ mod tests {
         dma.channels[0].sad = 0x0800_0000;
         dma.channels[0].dad = 0x0600_0000;
         dma.channels[0].count = 10;
-        dma.write_control(0, (1 << 15) | (1 << 12)); // VBlank
+        dma.write_control(0, (1 << 15) | (1 << 12), 0); // VBlank
 
         // Channel 2: HBlank
         dma.channels[2].sad = 0x0800_0000;
         dma.channels[2].dad = 0x0600_0000;
         dma.channels[2].count = 10;
-        dma.write_control(2, (1 << 15) | (2 << 12)); // HBlank
+        dma.write_control(2, (1 << 15) | (2 << 12), 0); // HBlank
 
         assert_eq!(dma.channels_for_timing(DmaTiming::VBlank), vec![0]);
         assert_eq!(dma.channels_for_timing(DmaTiming::HBlank), vec![2]);

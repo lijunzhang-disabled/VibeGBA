@@ -43,11 +43,24 @@ Every VBlank:
 
 Most games either call `SWI 0x1D` directly or inline equivalent register-toggle code into their VBlank IRQ handler. Pokémon Emerald is an outlier: our SWI tracer caught zero sound SWIs and our DMA-register-write tracer caught zero `DMA1/2` register writes after the boot init. The game must be relying on some path we haven't traced — possibly a CPU-accuracy bug along an instruction sequence the jsmolka tests don't exercise — to invoke the reset, and on real hardware it Just Works.
 
-Rather than guess at the missing path, we do the safe thing: at every VBlank, in the scheduler's `HBlankEnd` handler when scanline becomes 160, we look at DMA1 and DMA2; if either is `active` and timing is `Special`, we force `internal_sad = sad`. This is exactly what `SoundDriverVSync` does, just unconditional rather than triggered by the SWI.
+Rather than guess at the missing path, we do the safe thing: at every VBlank, in the scheduler's `HBlankEnd` handler when scanline becomes 160, we look at DMA1 and DMA2; if either is `active` and timing is `Special`, we force `internal_sad = sad`. This is exactly what `SoundDriverVSync` does, just driven by the scheduler rather than the SWI.
 
-The behavioural cost: for games that *do* call SWI 0x1D themselves, our reset is redundant (idempotent — re-latching to the same value is a no-op). We never worsen behaviour; we only rescue games like Pokémon that depend on the reset happening but don't drive it through a path our emulator handles.
+### The "recent latch" gate
 
-If you ever find a game whose audio breaks because of this auto-reset (e.g. a game intentionally lets DMA stream through a long contiguous buffer without resetting), the right fix is to remove the auto-reset and trace down why the game's SWI 0x1D / inlined equivalent isn't running.
+A naïve unconditional re-anchor breaks games that legitimately stream audio across multiple frames without re-anchoring per-VBlank. The clearest example is [velipso's gba-sound-demo](https://github.com/velipso/gba-sound-demo) `rates.gba` in the timer-driven modes (`16K*` / `32K*` / `65K*`): the demo sets up a separate Timer 1 that fires an IRQ every 311,296 cycles (≈ 1.114 frames), and the IRQ handler disables DMA1/2, writes new `SAD` values pointing at the next buffer, and re-enables — relying on the natural 0→1 enable latch to install the new source. The buffer takes ~1.114 frames to play, so a VBlank fires partway through each buffer. If we re-anchor on that VBlank we rewind `internal_sad` to the start of the current buffer, audibly looping the first ~16 ms of each buffer.
+
+So the re-anchor is gated: we record `last_latch_cycle` on each 0→1 enable transition (`DmaChannel.last_latch_cycle`, set in `DmaController::write_control`), and at VBlank we **skip** the re-anchor for any channel whose last latch was within the last ~2 frames. The threshold (`2 * CYCLES_PER_FRAME`) is wide enough to cover any game driving DMA at ≥ 30 Hz, and tight enough to catch Pokémon (which has `last_latch_cycle == 0` forever and is always outside the window).
+
+Decision table:
+
+| Game class | `last_latch_cycle` per VBlank | Action |
+|---|---|---|
+| Pokémon Emerald: no DMA writes after boot | stale (set once at boot) | re-anchor ✓ |
+| Most M4A games: SWI 0x1D every frame | always within 1 frame | skip — SWI 0x1D already re-latched |
+| velipso 16K*/32K*/65K*: IRQ buffer swap every ~1.1 frames | always within ~1.1 frames | skip — game's own swap handles it |
+| velipso 13K (VBlank-paced) | one-shot setup, no re-toggle | re-anchor ✓ (buffer is exactly 1 frame, same as M4A) |
+
+If you ever find a game whose audio breaks because of this auto-reset (e.g. a game intentionally lets DMA stream through a long contiguous buffer without resetting *and* without re-latching often enough to stay in the recency window), the right fix is to trace down why the game's expected reset path isn't running, rather than widen the threshold further.
 
 ## Why only Special-timed DMA needs this
 
@@ -78,18 +91,20 @@ Here the walking source pointer is the **whole point**. After 160 lines, the gam
 
 **Special (FIFO sound).** This is the odd one out. The game writes a **single buffer** and expects DMA to replay it on a loop while the CPU overwrites it each frame. The hardware's natural behaviour ("source advances every transfer") is *exactly wrong* for this. That's why the BIOS has a dedicated function — `SoundDriverVSync` (SWI 0x1D) — whose only job is to re-latch DMA1/DMA2 internal_sad every VBlank. It's a workaround for an architectural mismatch between FIFO DMA's source-advancement and the sample-replay use case.
 
-Hence our reset is filtered to `Special` timing only:
+Hence our reset is filtered to `Special` timing only, AND gated on latch recency:
 
 ```rust
+const RECENT_LATCH_CYCLES: u64 = 2 * CYCLES_PER_FRAME as u64;
+let now = self.scheduler.timestamp();
 for ch in [1usize, 2] {
     let c = &mut self.bus.dma.channels[ch];
-    if c.active && matches!(c.timing(), dma::DmaTiming::Special) {
-        c.internal_sad = c.sad & 0x07FF_FFFF;
-    }
+    if !(c.active && matches!(c.timing(), dma::DmaTiming::Special)) { continue; }
+    if now.saturating_sub(c.last_latch_cycle) <= RECENT_LATCH_CYCLES { continue; }
+    c.internal_sad = c.sad & 0x07FF_FFFF;
 }
 ```
 
-We don't touch HBlank-timed DMA channels (the HDMA scroll-table use case would break). We don't touch VBlank-timed DMA either — games handle their own re-latching there, and unconditionally snapping `internal_sad` could break long copies that intentionally span multiple VBlanks. We only fix what the BIOS's `SoundDriverVSync` would have fixed.
+We don't touch HBlank-timed DMA channels (the HDMA scroll-table use case would break). We don't touch VBlank-timed DMA either — games handle their own re-latching there, and unconditionally snapping `internal_sad` could break long copies that intentionally span multiple VBlanks. We only fix what the BIOS's `SoundDriverVSync` would have fixed, and only for channels the game isn't already managing itself.
 
 ## Where this lives in code
 

@@ -632,7 +632,7 @@ impl Bus {
     /// Write DMA control register, handling enable-bit transition.
     /// Returns Some(channel_id) if an immediate DMA should run.
     pub fn write_dma_control(&mut self, channel_id: usize, value: u16) -> Option<usize> {
-        self.dma.write_control(channel_id, value)
+        self.dma.write_control(channel_id, value, self.now)
     }
 
     // ─── Internal helpers ─────────────────────────────────────────

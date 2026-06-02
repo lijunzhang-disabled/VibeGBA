@@ -513,21 +513,43 @@ impl Gba {
                             }
                         }
                     }
+                    // VBlank FIFO-DMA re-anchor. Originally added to fix
+                    // Pokémon Emerald, which never re-latches DMA1/2 after
+                    // boot and would otherwise let internal_sad walk past its
+                    // 224-byte M4A buffer. See [[fifo-dma-vblank]] for the
+                    // full reasoning.
+                    //
+                    // Gate: only re-anchor channels that the game has NOT
+                    // recently latched itself. velipso's timer-driven sound
+                    // technique (rates.gba 16K*/32K*/65K* modes) toggles
+                    // DMA1/2 enable from an IRQ every ~311296 cycles to swap
+                    // buffers; that 0→1 transition already latches internal_sad
+                    // correctly. Our unconditional reset would then rewind the
+                    // read pointer mid-buffer, audibly looping the start of
+                    // each buffer. Skip the reset whenever the channel was
+                    // latched within the last ~2 frames — that covers any
+                    // game driving DMA at ≥30 Hz.
+                    const RECENT_LATCH_CYCLES: u64 = 2 * CYCLES_PER_FRAME as u64;
+                    let now = self.scheduler.timestamp();
                     for ch in [1usize, 2] {
                         let c = &mut self.bus.dma.channels[ch];
-                        if c.active && matches!(c.timing(), dma::DmaTiming::Special) {
-                            if dma_audio_trace {
-                                let advance = c.internal_sad
-                                    .wrapping_sub(c.sad & 0x07FF_FFFF);
-                                eprintln!(
-                                    "[DMA{}] vbl: sad=0x{:08X} internal_sad=0x{:08X} \
-                                     advanced={} bytes → re-anchor",
-                                    ch, c.sad & 0x07FF_FFFF, c.internal_sad,
-                                    advance
-                                );
-                            }
-                            c.internal_sad = c.sad & 0x07FF_FFFF;
+                        if !(c.active && matches!(c.timing(), dma::DmaTiming::Special)) {
+                            continue;
                         }
+                        if now.saturating_sub(c.last_latch_cycle) <= RECENT_LATCH_CYCLES {
+                            continue;
+                        }
+                        if dma_audio_trace {
+                            let advance = c.internal_sad
+                                .wrapping_sub(c.sad & 0x07FF_FFFF);
+                            eprintln!(
+                                "[DMA{}] vbl: sad=0x{:08X} internal_sad=0x{:08X} \
+                                 advanced={} bytes → re-anchor",
+                                ch, c.sad & 0x07FF_FFFF, c.internal_sad,
+                                advance
+                            );
+                        }
+                        c.internal_sad = c.sad & 0x07FF_FFFF;
                     }
                 } else if line == 0 {
                     // VBlank ends, new frame starts
