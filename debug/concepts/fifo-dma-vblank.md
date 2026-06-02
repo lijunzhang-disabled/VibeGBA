@@ -62,6 +62,14 @@ Decision table:
 
 If you ever find a game whose audio breaks because of this auto-reset (e.g. a game intentionally lets DMA stream through a long contiguous buffer without resetting *and* without re-latching often enough to stay in the recency window), the right fix is to trace down why the game's expected reset path isn't running, rather than widen the threshold further.
 
+### Known residual: velipso `*` modes crackle even after the gate
+
+velipso's `rates.gba` in `16K*`/`32K*`/`65K*` still has audible crackling at every buffer-swap boundary (≈ 53 Hz), even though the gate correctly leaves `internal_sad` alone. The diagnostic in `examples/audio_dma_trace.rs` confirms Timer 1 IRQs fire at the expected ≈ 311,296-cycle cadence and DMA1 re-latches on each swap.
+
+The cause is that velipso's technique relies on Timer 1's first overflow coinciding *to the cycle* with VBlank, achieved by a hand-calibrated 250,475-cycle wait at startup. Our ARM7TDMI cycle accounting for IRQ entry, STMFD/LDMFD in the HLE BIOS IRQ stub, ROM wait states, and pipeline refills differs from real hardware by a small but nonzero number of cycles, so the two IRQs never end up pending in the same dispatch (the "both IRQs at once" condition that lights velipso's bottom-left alignment indicator). Each buffer swap therefore happens a handful of cycles late, and DMA reads ~5–15 samples past the buffer's end before the new `SAD` is installed — that's the click.
+
+Fixing this requires bringing global ARM7TDMI / BIOS-stub / wait-state cycle counts to single-cycle accuracy, which is the same multi-month rewrite that the FE7 investigation (`debug/2026-05-24_fe7-hblank-irq-cascade.md`) concluded was not worth pursuing for one game. No mainstream game uses this trick (it requires hand-tuned cycle delays), so we accept it as a known limitation — flagged here rather than silently buried.
+
 ## Why only Special-timed DMA needs this
 
 A natural follow-up: if `internal_sad` walks forever, doesn't *every* DMA channel have this problem — including the VBlank/HBlank ones used for graphics? Why is our reset specifically targeting `Special`-timed DMA1/DMA2?
