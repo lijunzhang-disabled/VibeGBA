@@ -71,7 +71,10 @@ impl Channel1 {
     pub fn trigger(&mut self) {
         self.enabled = true;
         if self.length_counter == 0 { self.length_counter = 64; }
-        self.timer = (2048 - self.frequency as u32) * 4;
+        // GBATEK: f_audio = 131072 / (2048-F) Hz; 8 duty steps per waveform.
+        // PSG period divider runs at 1.048576 MHz = CPU_CLOCK / 16, so one
+        // duty step = (2048-F) PSG ticks = (2048-F) * 16 CPU cycles.
+        self.timer = (2048 - self.frequency as u32) * 16;
         self.envelope_volume = self.envelope_init;
         self.envelope_timer = self.envelope_period;
         self.sweep_shadow = self.frequency;
@@ -136,7 +139,7 @@ impl Channel1 {
         if !self.enabled { return 0; }
         if self.timer > 0 { self.timer -= 1; }
         if self.timer == 0 {
-            self.timer = (2048 - self.frequency as u32) * 4;
+            self.timer = (2048 - self.frequency as u32) * 16;
             self.duty_pos = (self.duty_pos + 1) % 8;
         }
         self.output()
@@ -182,7 +185,7 @@ impl Channel2 {
     pub fn trigger(&mut self) {
         self.enabled = true;
         if self.length_counter == 0 { self.length_counter = 64; }
-        self.timer = (2048 - self.frequency as u32) * 4;
+        self.timer = (2048 - self.frequency as u32) * 16;
         self.envelope_volume = self.envelope_init;
         self.envelope_timer = self.envelope_period;
         if self.envelope_init == 0 && !self.envelope_dir { self.enabled = false; }
@@ -212,7 +215,7 @@ impl Channel2 {
         if !self.enabled { return 0; }
         if self.timer > 0 { self.timer -= 1; }
         if self.timer == 0 {
-            self.timer = (2048 - self.frequency as u32) * 4;
+            self.timer = (2048 - self.frequency as u32) * 16;
             self.duty_pos = (self.duty_pos + 1) % 8;
         }
         self.output()
@@ -258,7 +261,9 @@ impl Channel3 {
     pub fn trigger(&mut self) {
         self.enabled = self.dac_enabled;
         if self.length_counter == 0 { self.length_counter = 256; }
-        self.timer = (2048 - self.frequency as u32) * 2;
+        // GBATEK: per-sample rate = 2097152 / (2048-F) Hz.
+        // 2.097152 MHz = CPU_CLOCK / 8, so one sample = (2048-F) * 8 CPU cycles.
+        self.timer = (2048 - self.frequency as u32) * 8;
         self.sample_pos = 0;
     }
 
@@ -273,7 +278,7 @@ impl Channel3 {
         if !self.enabled || !self.dac_enabled { return 0; }
         if self.timer > 0 { self.timer -= 1; }
         if self.timer == 0 {
-            self.timer = (2048 - self.frequency as u32) * 2;
+            self.timer = (2048 - self.frequency as u32) * 8;
             let total_samples = if self.dimension { 64 } else { 32 };
             self.sample_pos = (self.sample_pos + 1) % total_samples;
         }
@@ -351,7 +356,10 @@ impl Channel4 {
     pub fn trigger(&mut self) {
         self.enabled = true;
         if self.length_counter == 0 { self.length_counter = 64; }
-        self.timer = self.divisor() << self.clock_shift;
+        // GBATEK: LFSR clock = 524288 / r / 2^(s+1) Hz. divisor() encodes
+        // the (r, +1-shift) part in PSG-clock cycles; convert to CPU
+        // cycles by ×4 (PSG runs at CPU_CLOCK / 4 internally).
+        self.timer = (self.divisor() << self.clock_shift) * 4;
         self.envelope_volume = self.envelope_init;
         self.envelope_timer = self.envelope_period;
         self.lfsr = 0x7FFF;
@@ -382,7 +390,7 @@ impl Channel4 {
         if !self.enabled { return 0; }
         if self.timer > 0 { self.timer -= 1; }
         if self.timer == 0 {
-            self.timer = self.divisor() << self.clock_shift;
+            self.timer = (self.divisor() << self.clock_shift) * 4;
             let xor_bit = (self.lfsr & 1) ^ ((self.lfsr >> 1) & 1);
             self.lfsr >>= 1;
             self.lfsr |= xor_bit << 14;
@@ -430,12 +438,58 @@ mod tests {
         ch.divisor_code = 1;
         ch.trigger();
         assert!(ch.enabled);
-        // LFSR should produce varying output
+        // LFSR should produce varying output. At divisor_code=1, shift=0
+        // the LFSR clocks every 64 CPU cycles (16 PSG ticks × 4), so we
+        // need enough cycles to see ≥1 bit transition — the LFSR starts at
+        // 0x7FFF (all ones in the low bits) and takes ~15 steps before
+        // bit 0 changes.
         let mut samples = std::collections::HashSet::new();
-        for _ in 0..500 {
+        for _ in 0..4000 {
             samples.insert(ch.tick());
         }
         assert!(samples.len() > 1, "Noise should produce varied output");
+    }
+
+    /// GBA spec (GBATEK): ch1 audio frequency = 131072 / (2048-F) Hz.
+    /// For F=1024 that's 128 Hz, so a full waveform takes 131072 CPU cycles.
+    /// A previous bug used `(2048-F) * 4` for the duty-step timer, making
+    /// every PSG channel run 4× too fast (2 octaves up) — most audible on
+    /// isolated SFX bursts. This test pins the spec rate so it can't drift.
+    #[test]
+    fn ch1_full_waveform_period_matches_gba_spec() {
+        let mut ch = Channel1::new();
+        ch.duty = 2; // 50%
+        ch.frequency = 1024;
+        ch.envelope_init = 15;
+        ch.envelope_dir = false;
+        ch.envelope_period = 0;
+        ch.length_enabled = false;
+        ch.trigger();
+
+        // Find the first H→L transition (output goes from + to -).
+        let mut last = ch.tick();
+        let mut first_h_to_l = 0u64;
+        for c in 2u64..400_000 {
+            let v = ch.tick();
+            if v < last && last > 0 { first_h_to_l = c; last = v; break; }
+            last = v;
+        }
+        assert!(first_h_to_l != 0, "never saw first H→L transition");
+
+        // Find the next H→L transition. The gap is one full waveform.
+        let mut second_h_to_l = 0u64;
+        for c in first_h_to_l + 1..1_000_000 {
+            let v = ch.tick();
+            if v < last && last > 0 { second_h_to_l = c; break; }
+            last = v;
+        }
+        let waveform_cycles = second_h_to_l - first_h_to_l;
+        let expected = (2048u64 - 1024) * 16 * 8; // 131072 cycles
+        assert_eq!(
+            waveform_cycles, expected,
+            "ch1 full-waveform period: got {} CPU cycles, spec wants {} for F=1024",
+            waveform_cycles, expected,
+        );
     }
 
     #[test]
