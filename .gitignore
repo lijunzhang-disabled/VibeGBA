@@ -2,8 +2,8 @@
 /target
 
 # User-supplied content
-test-roms/*.gba
-test-roms/*.bin
+test-roms/**/*.gba
+test-roms/**/*.bin
 
 # Per-ROM save data and save states (next to the ROM file)
 *.sav

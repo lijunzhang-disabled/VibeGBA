@@ -480,6 +480,31 @@ impl Apu {
                     | ((self.ch2.envelope_init as u16) << 12)
             }
             0x0C => self.ch2.frequency | ((self.ch2.length_enabled as u16) << 14),
+            // SOUNDCNT_L — PSG L/R volume + per-channel L/R enables.
+            // All bits 0..15 are R/W except 3,7 (unused, read as 0).
+            0x20 => {
+                let mut v = (self.psg_volume_right as u16 & 7)
+                    | ((self.psg_volume_left as u16 & 7) << 4);
+                for i in 0..4 {
+                    if self.psg_enable_right[i] { v |= 1 << (8 + i); }
+                    if self.psg_enable_left[i]  { v |= 1 << (12 + i); }
+                }
+                v
+            }
+            // SOUNDCNT_H — DirectSound mix control. Bits 4-7 unused, bits 11/15
+            // are write-only FIFO-reset triggers — readback mask is 0x770F.
+            0x22 => {
+                let mut v = self.psg_master_volume as u16 & 3;
+                if self.fifo_a.volume_full   { v |= 1 << 2; }
+                if self.fifo_b.volume_full   { v |= 1 << 3; }
+                if self.fifo_a.enable_right  { v |= 1 << 8; }
+                if self.fifo_a.enable_left   { v |= 1 << 9; }
+                v |= (self.fifo_a.timer_select as u16 & 1) << 10;
+                if self.fifo_b.enable_right  { v |= 1 << 12; }
+                if self.fifo_b.enable_left   { v |= 1 << 13; }
+                v |= (self.fifo_b.timer_select as u16 & 1) << 14;
+                v
+            }
             0x24 => {
                 (self.ch1.enabled as u16)
                     | ((self.ch2.enabled as u16) << 1)

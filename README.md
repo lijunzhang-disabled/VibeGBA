@@ -71,6 +71,21 @@ Controls, save-state hotkeys, BIOS info, and troubleshooting are in [`USAGE.md`]
 | Belogic Sound Tests | `soundtest1-4.gba`, `sound3demorom.gba`, `directsoundrom.gba` (5 ROMs) | ✅ All boot, render UI, audio plays correctly |
 | Tonc GBA Demos (Jasper Vijn) | 34 demo ROMs covering BG modes, sprites, affine, blending, windows, DMA, timers, IRQ, SWI, text rendering | ✅ All 34 boot and render correctly |
 
+[alyosha-tas/gba-tests](https://github.com/alyosha-tas/gba-tests) — FIFO and DMA timing accuracy:
+
+| ROM | Status |
+|---|---|
+| `fifo_dma/fifo.gba` | Test 2 fails (DMA-while-sound-off quirk — hardware-edge, not seen in games) |
+| `fifo_dma/fifo_6.gba` | ✅ ALL PASS |
+| `fifo_dma/fifo_2..5.gba` | Fail (cycle-accurate timer+DMA timing with prefetch — mGBA, ares, NanoBoyAdvance also fail these at higher numbers) |
+
+[velipso/gba-sound-demo](https://github.com/velipso/gba-sound-demo) — audible A/B reference (no automated pass/fail):
+
+| ROM | What it exercises |
+|---|---|
+| `sound/rates.gba` | Switchable sample rates 13K–65K Hz, 8–10 bit depths, dithering on/off |
+| `sound/song.gba` | Same song played simultaneously at two different rates (VBlank-paced + timer-paced) |
+
 Drop test ROMs into `test-roms/` and run `cargo run --release --example check_test -- test-roms/<rom>.gba` to verify on your machine. The runner detects "All tests passed" by checking the mode-4 framebuffer where the test framework renders its result.
 
 ### Playable games (spot-tested)
