@@ -256,12 +256,15 @@ impl Apu {
         let scaled_left = (avg_left * 120).clamp(-32768, 32767);
         let scaled_right = (avg_right * 120).clamp(-32768, 32767);
 
-        // 1-stage gentle IIR post-filter (α=0.5) — just smooth step edges.
-        self.lpf_left[0] = (self.lpf_left[0] + scaled_left) / 2;
-        self.lpf_right[0] = (self.lpf_right[0] + scaled_right) / 2;
-
-        let left_out = self.lpf_left[0].clamp(-32768, 32767) as i16;
-        let right_out = self.lpf_right[0].clamp(-32768, 32767) as i16;
+        // No post-IIR. The boxcar averaging over ~349 cycles already
+        // anti-aliases — its first null sits at fs_in/L ≈ 48 kHz, on top
+        // of the output Nyquist. The previous y[n] = (y[n-1] + x[n]) / 2
+        // post-filter (α=0.5) added another −3 dB at 5.5 kHz and −8 dB
+        // at 16 kHz, which made everything sound muffled compared to a
+        // hardware/mGBA reference. Drop it. lpf_* fields kept for serde
+        // backward compatibility but unused on the active path.
+        let left_out = scaled_left.clamp(-32768, 32767) as i16;
+        let right_out = scaled_right.clamp(-32768, 32767) as i16;
         self.push_pair(left_out, right_out);
     }
 
