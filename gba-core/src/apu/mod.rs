@@ -252,9 +252,16 @@ impl Apu {
         self.accum_count = 0;
 
         // Scale: averaging over ~349 cycles suppresses peaks, so we compensate.
-        // 120× balances loudness (peaks ~15k) against transient noise.
-        let scaled_left = (avg_left * 120).clamp(-32768, 32767);
-        let scaled_right = (avg_right * 120).clamp(-32768, 32767);
+        // 200× was calibrated against mGBA's SDL-disk-audio output for
+        // Shining Soul II's title screen: post-RMS-normalised spectra are
+        // already within ±0.3 dB of mGBA, but our absolute RMS came in
+        // ~40 % lower (peaks ~10k vs mGBA's ~18k), making everything sound
+        // too quiet. Bumping the multiplier matches mGBA's loudness with
+        // comfortable headroom — pre-clamp peaks land around 0.6× full
+        // scale on dense mixes (HoD, SS2). The clamp() below catches any
+        // outlier transients on louder games.
+        let scaled_left = (avg_left * 200).clamp(-32768, 32767);
+        let scaled_right = (avg_right * 200).clamp(-32768, 32767);
 
         // No post-IIR. The boxcar averaging over ~349 cycles already
         // anti-aliases — its first null sits at fs_in/L ≈ 48 kHz, on top
