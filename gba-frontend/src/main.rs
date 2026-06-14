@@ -1,6 +1,7 @@
 mod video;
 mod audio;
 mod input;
+mod harness;
 
 use clap::Parser;
 use gba_core::Gba;
@@ -11,8 +12,9 @@ use std::time::{Duration, Instant};
 #[derive(Parser)]
 #[command(name = "gba-emu", about = "GBA Emulator")]
 struct Args {
-    /// Path to the GBA ROM file
-    rom: String,
+    /// Path to the GBA ROM file (optional in --harness mode, where the
+    /// driving agent sends the ROM path over the protocol instead).
+    rom: Option<String>,
 
     /// Path to the BIOS file (optional, uses HLE if not provided)
     #[arg(short, long)]
@@ -29,6 +31,12 @@ struct Args {
     /// Disable audio
     #[arg(long)]
     no_audio: bool,
+
+    /// Headless harness mode: no SDL window. Speaks the Emulator Harness
+    /// Protocol (EHP) on stdin/stdout so the emu-agent can drive playback and
+    /// capture audio/video. See ../emu-agent/docs/protocol.md.
+    #[arg(long)]
+    harness: bool,
 
     /// Test mode: render a fixed color pattern instead of running the ROM
     /// (sanity-check that SDL2 rendering works end-to-end).
@@ -350,18 +358,30 @@ fn main() {
     env_logger::init();
     let args = Args::parse();
 
-    // Load ROM
-    let rom = fs::read(&args.rom).unwrap_or_else(|e| {
-        eprintln!("Failed to read ROM '{}': {}", args.rom, e);
-        std::process::exit(1);
-    });
-
-    // Load BIOS
-    let bios = args.bios.map(|path| {
-        fs::read(&path).unwrap_or_else(|e| {
+    // Load BIOS (shared by both the normal and harness paths).
+    let bios = args.bios.as_ref().map(|path| {
+        fs::read(path).unwrap_or_else(|e| {
             eprintln!("Failed to read BIOS '{}': {}", path, e);
             std::process::exit(1);
         })
+    });
+
+    // Headless harness mode: no SDL, drive emulation over stdin/stdout EHP.
+    if args.harness {
+        harness::run(bios, args.skip_bios);
+        return;
+    }
+
+    // Normal interactive mode requires a ROM path.
+    let rom_path = args.rom.clone().unwrap_or_else(|| {
+        eprintln!("error: a ROM path is required (unless --harness)");
+        std::process::exit(1);
+    });
+
+    // Load ROM
+    let rom = fs::read(&rom_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read ROM '{}': {}", rom_path, e);
+        std::process::exit(1);
     });
 
     // Create GBA instance
@@ -372,10 +392,10 @@ fn main() {
     }
 
     // Load .sav file
-    let sav = sav_path(&args.rom);
+    let sav = sav_path(&rom_path);
     load_sav(&mut gba, &sav);
 
-    let state = state_path(&args.rom);
+    let state = state_path(&rom_path);
 
     // Initialize SDL2
     let sdl_context = sdl2::init().expect("Failed to initialize SDL2");
