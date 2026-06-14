@@ -61,6 +61,20 @@ pub struct Apu {
     lpf_left: [i32; 1],
     lpf_right: [i32; 1],
 
+    // DC-blocking high-pass state (models the GBA's AC-coupled output). The
+    // M4A PCM stream carries a small DC component; real hardware (and mGBA)
+    // capacitor-couple it away. Without this the agent measured a steady
+    // negative DC offset on several games (HoD, Minish Cap, Shining Soul II).
+    // serde(default) so old save states without these fields still load.
+    #[serde(default)]
+    hp_in_l: i64,
+    #[serde(default)]
+    hp_out_l: i64,
+    #[serde(default)]
+    hp_in_r: i64,
+    #[serde(default)]
+    hp_out_r: i64,
+
     /// Output sample buffer — interleaved stereo i16 at OUTPUT_SAMPLE_RATE.
     pub sample_buffer: Vec<i16>,
     pub sample_buffer_max: usize,
@@ -90,6 +104,10 @@ impl Apu {
             accum_count: 0,
             lpf_left: [0; 1],
             lpf_right: [0; 1],
+            hp_in_l: 0,
+            hp_out_l: 0,
+            hp_in_r: 0,
+            hp_out_r: 0,
             sample_buffer: Vec::with_capacity(8192),
             sample_buffer_max: 16384,
         }
@@ -260,19 +278,36 @@ impl Apu {
         // comfortable headroom — pre-clamp peaks land around 0.6× full
         // scale on dense mixes (HoD, SS2). The clamp() below catches any
         // outlier transients on louder games.
-        let scaled_left = (avg_left * 200).clamp(-32768, 32767);
-        let scaled_right = (avg_right * 200).clamp(-32768, 32767);
+        let scaled_left = avg_left * 200;
+        let scaled_right = avg_right * 200;
 
-        // No post-IIR. The boxcar averaging over ~349 cycles already
-        // anti-aliases — its first null sits at fs_in/L ≈ 48 kHz, on top
-        // of the output Nyquist. The previous y[n] = (y[n-1] + x[n]) / 2
-        // post-filter (α=0.5) added another −3 dB at 5.5 kHz and −8 dB
-        // at 16 kHz, which made everything sound muffled compared to a
-        // hardware/mGBA reference. Drop it. lpf_* fields kept for serde
-        // backward compatibility but unused on the active path.
-        let left_out = scaled_left.clamp(-32768, 32767) as i16;
-        let right_out = scaled_right.clamp(-32768, 32767) as i16;
+        // No post-IIR low-pass: the boxcar averaging over ~349 cycles already
+        // anti-aliases (first null at fs_in/L ≈ 48 kHz). The old
+        // y[n] = (y[n-1]+x[n])/2 post-filter just muffled everything; dropped.
+        // We DO apply a DC-blocking high-pass to model the GBA's AC-coupled
+        // output (below). lpf_* fields kept for serde back-compat, unused.
+        let (hp_left, hp_right) = self.dc_block(scaled_left as i64, scaled_right as i64);
+
+        let left_out = hp_left.clamp(-32768, 32767) as i16;
+        let right_out = hp_right.clamp(-32768, 32767) as i16;
         self.push_pair(left_out, right_out);
+    }
+
+    /// One-pole DC-blocking high-pass: `y[n] = x[n] - x[n-1] + R*y[n-1]`.
+    /// R = 8187/8192 ≈ 0.99939 → cutoff ≈ 4.8 Hz at 48 kHz: removes the steady
+    /// DC the M4A PCM stream carries (as real hardware / mGBA's AC-coupled
+    /// output does) while leaving audible bass essentially untouched. A pure
+    /// DC term (0 Hz) is removed regardless of the exact cutoff.
+    fn dc_block(&mut self, xl: i64, xr: i64) -> (i64, i64) {
+        const R_NUM: i64 = 8187;
+        const R_DEN: i64 = 8192;
+        let yl = xl - self.hp_in_l + self.hp_out_l * R_NUM / R_DEN;
+        let yr = xr - self.hp_in_r + self.hp_out_r * R_NUM / R_DEN;
+        self.hp_in_l = xl;
+        self.hp_out_l = yl;
+        self.hp_in_r = xr;
+        self.hp_out_r = yr;
+        (yl, yr)
     }
 
     fn push_pair(&mut self, left: i16, right: i16) {
