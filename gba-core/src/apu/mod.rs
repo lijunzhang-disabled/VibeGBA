@@ -75,6 +75,17 @@ pub struct Apu {
     #[serde(default)]
     hp_out_r: i64,
 
+    // High-frequency emphasis (treble/sinc-compensation) state. VibeGBA emits
+    // sample-and-hold stairsteps then box-averages to 48 kHz; mGBA uses
+    // band-limited synthesis with no HF droop. The emu-agent's differential
+    // A/B vs mGBA measured a -5 dB rolloff above ~9 kHz (dull voice SFX), so we
+    // apply a first-order emphasis y[n] = x[n] + k*(x[n]-x[n-1]) that flattens
+    // it toward mGBA. serde(default) keeps old save states loadable.
+    #[serde(default)]
+    emph_prev_l: i64,
+    #[serde(default)]
+    emph_prev_r: i64,
+
     /// Output sample buffer — interleaved stereo i16 at OUTPUT_SAMPLE_RATE.
     pub sample_buffer: Vec<i16>,
     pub sample_buffer_max: usize,
@@ -108,6 +119,8 @@ impl Apu {
             hp_out_l: 0,
             hp_in_r: 0,
             hp_out_r: 0,
+            emph_prev_l: 0,
+            emph_prev_r: 0,
             sample_buffer: Vec::with_capacity(8192),
             sample_buffer_max: 16384,
         }
@@ -287,9 +300,10 @@ impl Apu {
         // We DO apply a DC-blocking high-pass to model the GBA's AC-coupled
         // output (below). lpf_* fields kept for serde back-compat, unused.
         let (hp_left, hp_right) = self.dc_block(scaled_left as i64, scaled_right as i64);
+        let (em_left, em_right) = self.hf_emphasis(hp_left, hp_right);
 
-        let left_out = hp_left.clamp(-32768, 32767) as i16;
-        let right_out = hp_right.clamp(-32768, 32767) as i16;
+        let left_out = em_left.clamp(-32768, 32767) as i16;
+        let right_out = em_right.clamp(-32768, 32767) as i16;
         self.push_pair(left_out, right_out);
     }
 
@@ -307,6 +321,22 @@ impl Apu {
         self.hp_out_l = yl;
         self.hp_in_r = xr;
         self.hp_out_r = yr;
+        (yl, yr)
+    }
+
+    /// First-order high-frequency emphasis: `y[n] = x[n] + k*(x[n]-x[n-1])`
+    /// with k ≈ 0.6 (614/1024). Unity gain at DC (no effect on level/bass),
+    /// rising to ~+4.7 dB at 16 kHz — flattens the sample-and-hold + boxcar
+    /// HF rolloff toward mGBA. k=0.6 was fit by the emu-agent's spectral A/B:
+    /// it brings the 9–16 kHz bands from ~-5 dB to within ~1 dB of mGBA
+    /// without overcooking the mids (k=0.75 made 3–9 kHz too bright).
+    fn hf_emphasis(&mut self, xl: i64, xr: i64) -> (i64, i64) {
+        const K_NUM: i64 = 614; // ≈ 0.6
+        const K_DEN: i64 = 1024;
+        let yl = xl + K_NUM * (xl - self.emph_prev_l) / K_DEN;
+        let yr = xr + K_NUM * (xr - self.emph_prev_r) / K_DEN;
+        self.emph_prev_l = xl;
+        self.emph_prev_r = xr;
         (yl, yr)
     }
 
