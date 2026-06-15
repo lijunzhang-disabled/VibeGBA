@@ -325,13 +325,15 @@ impl Apu {
     }
 
     /// First-order high-frequency emphasis: `y[n] = x[n] + k*(x[n]-x[n-1])`
-    /// with k ≈ 0.6 (614/1024). Unity gain at DC (no effect on level/bass),
-    /// rising to ~+4.7 dB at 16 kHz — flattens the sample-and-hold + boxcar
-    /// HF rolloff toward mGBA. k=0.6 was fit by the emu-agent's spectral A/B:
-    /// it brings the 9–16 kHz bands from ~-5 dB to within ~1 dB of mGBA
-    /// without overcooking the mids (k=0.75 made 3–9 kHz too bright).
+    /// with k = 0.5 (512/1024). Unity gain at DC (no effect on level/bass),
+    /// rising to ~+3.5 dB at 16 kHz — flattens the sample-and-hold + boxcar
+    /// HF rolloff toward mGBA. Originally fit to k=0.6 on title music, then
+    /// trimmed to 0.5: the emu-agent's same-room HoD attack-SFX A/B vs mGBA
+    /// showed k=0.6 ran ~+3–4 dB hot in 2–12 kHz on transients (and Golden
+    /// Sun's top octave likewise), so 0.5 lands closer to mGBA without
+    /// re-muffling the voice. (k=0.75 made 3–9 kHz clearly too bright.)
     fn hf_emphasis(&mut self, xl: i64, xr: i64) -> (i64, i64) {
-        const K_NUM: i64 = 614; // ≈ 0.6
+        const K_NUM: i64 = 512; // = 0.5
         const K_DEN: i64 = 1024;
         let yl = xl + K_NUM * (xl - self.emph_prev_l) / K_DEN;
         let yr = xr + K_NUM * (xr - self.emph_prev_r) / K_DEN;
