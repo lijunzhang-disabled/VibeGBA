@@ -60,6 +60,9 @@ struct Harness {
     buttons: u16,
     audio_accum: Vec<i16>,
     audio_tmp: Vec<i16>,
+    /// Cartridge backup (.sav) bytes, re-applied on every (re)build so a loaded
+    /// save survives `reset` — a real cartridge save isn't wiped by a console reset.
+    save: Option<Vec<u8>>,
 }
 
 impl Harness {
@@ -73,6 +76,7 @@ impl Harness {
             buttons: 0,
             audio_accum: Vec::with_capacity(96_000),
             audio_tmp: vec![0i16; 8192],
+            save: None,
         }
     }
 
@@ -82,6 +86,10 @@ impl Harness {
         let mut gba = Gba::new(self.bios.clone(), rom);
         if self.skip_bios {
             gba.cpu = gba_core::arm7tdmi::Cpu::new_skip_bios();
+        }
+        // Re-apply the cartridge save so it survives reset/rebuild.
+        if let Some(save) = &self.save {
+            gba.import_save(save);
         }
         self.gba = Some(gba);
         self.frame_index = 0;
@@ -154,6 +162,7 @@ impl Harness {
         let path = req.get("path").and_then(Value::as_str).ok_or("missing path")?;
         let data = fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
         self.gba_mut()?.import_save(&data);
+        self.save = Some(data); // persist so it survives a later reset
         Ok(())
     }
 
