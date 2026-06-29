@@ -187,6 +187,22 @@ impl Bus {
             prefetch: Prefetch::new(),
             fetch_mode: None,
         };
+        let mut bus = bus;
+        if !has_bios {
+            // Post-BIOS handoff state: the real GBA BIOS leaves the LCD in
+            // forced-blank (DISPCNT bit 7) when it hands control to the
+            // cartridge. With HLE BIOS / skip-BIOS we never run that boot
+            // sequence, so we must seed it here. This matters for games whose
+            // init enables the VBlank IRQ via a register manager that only
+            // writes hardware DISPSTAT directly while VCOUNT is in VBlank OR
+            // forced-blank is set (Pokémon Emerald's SetGpuReg). Without
+            // forced-blank at handoff, that bootstrap write becomes sensitive
+            // to the CPU↔PPU phase and can be missed under accurate fetch
+            // timing — VBlankIntrWait then deadlocks (the VBlank IRQ is never
+            // actually enabled in hardware). See debug/2026-06-21_cpu-timing-
+            // prefetch-wip.md (Emerald hang).
+            bus.io.dispcnt = 0x0080;
+        }
         bus
     }
 
@@ -213,11 +229,13 @@ impl Bus {
         // 3=full. Default OFF: this is WIP on the cpu-timing-prefetch branch.
         //   * mode 2 (data wait-states) validated safe on all games tested.
         //   * mode 1/3 (opcode-fetch prefetch) improves the alyosha prefetcher
-        //     tests (full_arm_2 26→73, full_thumb 16→35) BUT hangs Pokémon
-        //     Emerald: it spins forever at a register-poll loop at ROM 0x080008C6
-        //     (`LDRH r1,[r2,#0x1C]; ANDS r0,r1,#1; BEQ` — waits for a hardware
-        //     bit that the fetch-timing change prevents from setting; Serial IRQ
-        //     enabled at that point). Root-cause that before enabling by default.
+        //     tests (full_arm_2 26→73, full_thumb 16→35). These modes used to
+        //     hang Pokémon Emerald at the WaitForVBlank poll loop (ROM
+        //     0x080008C6); that was a skip-BIOS DISPCNT bug (forced-blank not
+        //     seeded at handoff), now fixed in Bus::new. Modes 1/3 boot Emerald
+        //     correctly. Still default OFF pending the audio-oracle regression
+        //     pass before flipping the default. See debug/2026-06-21_cpu-timing-
+        //     prefetch-wip.md.
         let mode = *TIMING_MODE.get_or_init(|| {
             std::env::var("TIMING_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0u8)
         });

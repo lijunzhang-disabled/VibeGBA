@@ -27,7 +27,34 @@ differential audio oracle is the regression gate.
 - **mode 1/3 (opcode-fetch prefetch): improves prefetcher tests** (full_arm_2
   26→73, full_thumb 16→35; full_thumb correctness preserved) **BUT HANGS Emerald.**
 
-## The Emerald hang (the blocker — START HERE)
+## RESOLVED (2026-06-29): the Emerald hang was a skip-BIOS DISPCNT bug
+Root cause was **not** in the prefetch/fetch-timing model at all. `skip_bios`
+(and the HLE-BIOS path) left `DISPCNT = 0`, but the real GBA BIOS hands control
+to the cartridge with **forced-blank set (DISPCNT bit 7 = 0x0080)**.
+
+Why that deadlocks Emerald: its GPU register manager `SetGpuReg`
+(pokeemerald `src/gpu_regs.c`) writes the *hardware* DISPSTAT directly only when
+`VCOUNT ∈ [161,225]` **or** forced-blank is set; otherwise it queues to a shadow
+buffer that is flushed only inside `VBlankIntr`. The very first
+`EnableInterrupts(INTR_FLAG_VBLANK)` (InitIntrHandlers) → `SetGpuReg(DISPSTAT)`
+is what bootstraps the hardware VBlank-IRQ-enable bit (DISPSTAT 0x0008). With
+forced-blank set at handoff that write always lands; without it, the bootstrap
+becomes sensitive to the CPU↔PPU phase. Mode 0 happened to catch VCOUNT in the
+VBlank window; the mode-1 fetch timing shifted the phase so every
+`SetGpuReg(DISPSTAT)` queued instead → DISPSTAT 0x0008 never set in hardware →
+VBlank IRQ never fires → `WaitForVBlank` (ROM `0x080008C6`, polling
+`gMain.intrCheck` bit0 at IWRAM `gMain+0x1C` = `0x030022DC`) spins forever.
+
+Fix: `Bus::new` seeds `io.dispcnt = 0x0080` when `!has_bios` (HLE/skip path).
+Verified: Emerald boots under TIMING_MODE 0/1/2/3 (VBlank IRQs fire); jsmolka
+arm/thumb/memory ALL PASS in modes 0/2/3; 91 unit tests pass; HoD/GoldenSun
+render identically to the pre-fix baseline (no mode-0 regression). Diagnostic:
+`gba-core/examples/emerald_hang.rs`.
+
+Remaining work: validate audio with the emu-agent differential oracle, then
+decide whether to flip TIMING_MODE default from 0 (off) to 3 (full).
+
+## (HISTORICAL) The Emerald hang investigation notes
 Under mode 1, Emerald freezes early in boot, spinning at ROM `0x080008C6`:
 ```
 0x8B8: STRH r0,[r2,#0x1C]
