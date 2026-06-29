@@ -17,6 +17,10 @@ pub const CPU_CLOCK_HZ: u32 = 16_777_216;
 /// Frame sequencer runs at 512 Hz → one step every CPU_CLOCK_HZ / 512 cycles.
 pub const CYCLES_PER_FRAME_SEQ: u32 = 32_768;
 
+/// HF-emphasis coefficient numerator (out of 1024), cached from HF_EMPHASIS_K.
+/// Default 512 (k=0.5); used only for A/B experiments.
+static HF_K_NUM: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
 #[derive(Serialize, Deserialize)]
 pub struct Apu {
     // PSG channels
@@ -333,10 +337,16 @@ impl Apu {
     /// Sun's top octave likewise), so 0.5 lands closer to mGBA without
     /// re-muffling the voice. (k=0.75 made 3–9 kHz clearly too bright.)
     fn hf_emphasis(&mut self, xl: i64, xr: i64) -> (i64, i64) {
-        const K_NUM: i64 = 512; // = 0.5
+        // k = 0.5 (512/1024) default; HF_EMPHASIS_K env overrides the numerator
+        // (out of 1024) for A/B experiments, e.g. HF_EMPHASIS_K=0 disables it.
         const K_DEN: i64 = 1024;
-        let yl = xl + K_NUM * (xl - self.emph_prev_l) / K_DEN;
-        let yr = xr + K_NUM * (xr - self.emph_prev_r) / K_DEN;
+        let k_num: i64 = HF_K_NUM.get_or_init(|| {
+            std::env::var("HF_EMPHASIS_K").ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(512)
+        }).clone();
+        let yl = xl + k_num * (xl - self.emph_prev_l) / K_DEN;
+        let yr = xr + k_num * (xr - self.emph_prev_r) / K_DEN;
         self.emph_prev_l = xl;
         self.emph_prev_r = xr;
         (yl, yr)
