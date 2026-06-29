@@ -225,19 +225,20 @@ impl Bus {
     /// prefetch-aware path; a data access pays full wait-states.
     #[inline]
     pub fn add_mem_cycles(&mut self, addr: u32, width_bytes: u32) {
-        // TIMING_MODE gate: 0=off(default), 1=fetch/prefetch-only, 2=data-waitstate-only,
-        // 3=full. Default OFF: this is WIP on the cpu-timing-prefetch branch.
+        // TIMING_MODE gate: 0=off, 1=fetch/prefetch-only, 2=data-waitstate-only,
+        // 3=full (DEFAULT). Set TIMING_MODE=N to override (e.g. =0 for A/B).
         //   * mode 2 (data wait-states) validated safe on all games tested.
         //   * mode 1/3 (opcode-fetch prefetch) improves the alyosha prefetcher
-        //     tests (full_arm_2 26→73, full_thumb 16→35). These modes used to
-        //     hang Pokémon Emerald at the WaitForVBlank poll loop (ROM
-        //     0x080008C6); that was a skip-BIOS DISPCNT bug (forced-blank not
-        //     seeded at handoff), now fixed in Bus::new. Modes 1/3 boot Emerald
-        //     correctly. Still default OFF pending the audio-oracle regression
-        //     pass before flipping the default. See debug/2026-06-21_cpu-timing-
-        //     prefetch-wip.md.
+        //     tests (full_arm_2 26→73, full_thumb 16→35) and makes the HoD
+        //     jump-SFX onset frame-accurate vs mGBA (mode 0 fired it ~55 ms
+        //     late). These modes used to hang Pokémon Emerald at the
+        //     WaitForVBlank poll loop (ROM 0x080008C6); that was a skip-BIOS
+        //     DISPCNT bug (forced-blank not seeded at handoff), fixed in
+        //     Bus::new. Default flipped to 3 after the audio-oracle regression
+        //     pass (jsmolka pass, all games closer to mGBA, no regression).
+        //     See debug/2026-06-21_cpu-timing-prefetch-wip.md.
         let mode = *TIMING_MODE.get_or_init(|| {
-            std::env::var("TIMING_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0u8)
+            std::env::var("TIMING_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(3u8)
         });
         match self.fetch_mode.take() {
             Some(seq) if mode & 1 != 0 => self.charge_fetch(addr, width_bytes, seq),

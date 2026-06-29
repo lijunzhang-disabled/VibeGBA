@@ -51,8 +51,20 @@ arm/thumb/memory ALL PASS in modes 0/2/3; 91 unit tests pass; HoD/GoldenSun
 render identically to the pre-fix baseline (no mode-0 regression). Diagnostic:
 `gba-core/examples/emerald_hang.rs`.
 
-Remaining work: validate audio with the emu-agent differential oracle, then
-decide whether to flip TIMING_MODE default from 0 (off) to 3 (full).
+Audio validation (emu-agent oracle, 2026-06-29): DONE.
+- Aggregate spectral A/B vs mGBA: TIMING_MODE=3 safe and marginally CLOSER to
+  mGBA than mode 0 on HoD / Emerald / Golden Sun. No regression.
+- HoD jump-SFX onset (the original motivation): trigger press at frame 513,
+  mGBA SFX onset at frame 514. Mode 3 = frame 514 (frame-accurate); mode 0 =
+  frame 517-518 (~3-4 frames / ~55 ms late). Prefetch timing fixes the lag.
+  (Method: LLM-driven HoD save→gameplay trace + appended quiet→A→quiet tail;
+  single-pass save-loaded replay on emu modes 0/3 and mGBA. The built-in
+  `diff --sfx` is unusable for save traces — skips load_save + double-replays;
+  use ../emu-agent/compare_sfx_proper.py + inspect_sfx.py instead.)
+- Separate finding (not timing): mGBA has a constant ~0.07 RMS background in the
+  quiet standing segment where our emu is silent — ambient drone or DC artifact.
+
+Recommendation: flip TIMING_MODE default 0 -> 3. All gates pass.
 
 ## (HISTORICAL) The Emerald hang investigation notes
 Under mode 1, Emerald freezes early in boot, spinning at ROM `0x080008C6`:
