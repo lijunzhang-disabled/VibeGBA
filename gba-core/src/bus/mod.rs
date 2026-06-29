@@ -1,4 +1,6 @@
 pub mod io_regs;
+pub mod timing;
+use timing::{Prefetch, WaitTable};
 
 use crate::apu::Apu;
 use crate::backup::{self, BackupMedia};
@@ -120,7 +122,19 @@ pub struct Bus {
     /// correctness.
     #[serde(skip)]
     pub now: u64,
+    /// WAITCNT-decoded wait-state tables (recomputed on WAITCNT write).
+    #[serde(default = "WaitTable::new")]
+    pub wait: WaitTable,
+    /// GamePak prefetch-buffer state.
+    #[serde(default = "Prefetch::new")]
+    pub prefetch: Prefetch,
+    /// Set by fetch16/fetch32 so add_mem_cycles can tell an opcode fetch
+    /// (prefetch-aware) from a data access (wait-state). `Some(seq)`.
+    #[serde(skip)]
+    pub fetch_mode: Option<bool>,
 }
+
+static TIMING_MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
 
 impl Bus {
     pub fn new(bios: Option<Vec<u8>>, rom: Vec<u8>) -> Self {
@@ -169,6 +183,9 @@ impl Bus {
             mem_access_cycles: 0,
             last_access_end: 0xFFFFFFFF,
             now: 0,
+            wait: WaitTable::new(),
+            prefetch: Prefetch::new(),
+            fetch_mode: None,
         };
         bus
     }
@@ -183,16 +200,121 @@ impl Bus {
         self.last_access_end = 0xFFFFFFFF;
     }
 
-    /// Memory-access cycle accumulator hook. Currently a no-op (the
-    /// per-region wait-state model and GamePak prefetch buffer added
-    /// earlier this session caused subtle audio-timing regressions in
-    /// Pokémon Emerald without delivering a real-hardware-match for
-    /// FE7's M4A engine — the FE7 cascade turned out to be a missing
-    /// IntrWait re-halt, not a timing gap). Kept as a stable API so
-    /// read/write paths and any future cycle work can re-enable wait
-    /// states without touching every call site.
+    /// Maximum prefetch credit: ~8 buffered halfwords worth of cycles.
+    const PREFETCH_MAX_CREDIT: u32 = 64;
+
+    /// Memory-access cycle accumulator. Charges the *extra* cycles above the
+    /// 1-cycle baseline (already counted by the instruction handlers) for each
+    /// access. Dispatches on `fetch_mode`: an opcode fetch goes through the
+    /// prefetch-aware path; a data access pays full wait-states.
     #[inline]
-    pub fn add_mem_cycles(&mut self, _addr: u32, _width_bytes: u32) {}
+    pub fn add_mem_cycles(&mut self, addr: u32, width_bytes: u32) {
+        // TIMING_MODE gate: 0=off(default), 1=fetch/prefetch-only, 2=data-waitstate-only,
+        // 3=full. Default OFF: this is WIP on the cpu-timing-prefetch branch.
+        //   * mode 2 (data wait-states) validated safe on all games tested.
+        //   * mode 1/3 (opcode-fetch prefetch) improves the alyosha prefetcher
+        //     tests (full_arm_2 26→73, full_thumb 16→35) BUT hangs Pokémon
+        //     Emerald: it spins forever at a register-poll loop at ROM 0x080008C6
+        //     (`LDRH r1,[r2,#0x1C]; ANDS r0,r1,#1; BEQ` — waits for a hardware
+        //     bit that the fetch-timing change prevents from setting; Serial IRQ
+        //     enabled at that point). Root-cause that before enabling by default.
+        let mode = *TIMING_MODE.get_or_init(|| {
+            std::env::var("TIMING_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0u8)
+        });
+        match self.fetch_mode.take() {
+            Some(seq) if mode & 1 != 0 => self.charge_fetch(addr, width_bytes, seq),
+            Some(_) => {}
+            None if mode & 2 != 0 => self.charge_data(addr, width_bytes),
+            None => {}
+        }
+    }
+
+    /// Extra cycles for a data (non-opcode) access by region/width.
+    fn charge_data(&mut self, addr: u32, width: u32) {
+        let region = (addr >> 24) & 0x0F;
+        let extra = match region {
+            0x02 => if width >= 4 { 5 } else { 2 }, // EWRAM 16-bit bus
+            0x05 | 0x06 => if width >= 4 { 1 } else { 0 }, // palette/VRAM 16-bit bus
+            0x08..=0x0D => {
+                // ROM data access: non-sequential, and it disrupts the
+                // prefetch stream (the CPU stole the ROM bus).
+                let r = WaitTable::rom_region(addr);
+                self.prefetch.restart();
+                if width >= 4 {
+                    self.wait.rom_n16[r] + self.wait.rom_s16[r]
+                } else {
+                    self.wait.rom_n16[r]
+                }
+            }
+            0x0E | 0x0F => self.wait.sram, // SRAM/Flash 8-bit bus
+            _ => 0, // BIOS/IWRAM/IO/OAM: 32-bit bus, 1-cycle
+        };
+        self.mem_access_cycles += extra;
+    }
+
+    /// Extra cycles for an opcode fetch. ROM fetches use the prefetch buffer:
+    /// sequential fetches are hidden by accrued credit; non-sequential fetches
+    /// (branch targets) pay the full N wait-state and restart the buffer.
+    fn charge_fetch(&mut self, addr: u32, width: u32, seq: bool) {
+        let region = (addr >> 24) & 0x0F;
+        if !(0x08..=0x0D).contains(&region) {
+            // Code in EWRAM still pays its bus penalty; elsewhere 0 extra.
+            if region == 0x02 {
+                self.mem_access_cycles += if width >= 4 { 5 } else { 2 };
+            }
+            return;
+        }
+        let r = WaitTable::rom_region(addr);
+        let n = self.wait.rom_n16[r];
+        let s = self.wait.rom_s16[r];
+        let halfwords = if width >= 4 { 2 } else { 1 };
+        let mut extra = 0u32;
+        for hw in 0..halfwords {
+            let first = hw == 0;
+            if first && !seq {
+                // Non-sequential first fetch: full N, buffer restarts here.
+                self.prefetch.restart();
+                extra += n;
+            } else if self.wait.prefetch_enabled {
+                // Sequential fetch with prefetch: accrued credit hides the S
+                // wait-state. Uncovered remainder is charged; credit consumed.
+                let cost = s;
+                if self.prefetch.credit >= cost {
+                    self.prefetch.credit -= cost;
+                } else {
+                    extra += cost - self.prefetch.credit;
+                    self.prefetch.credit = 0;
+                }
+                self.prefetch.streaming = true;
+            } else {
+                // Sequential fetch, prefetch disabled: pay the S wait-state.
+                extra += s;
+                self.prefetch.streaming = true;
+            }
+        }
+        self.mem_access_cycles += extra;
+    }
+
+    /// Opcode fetch (16-bit, THUMB). `seq` = sequential pipeline advance.
+    #[inline]
+    pub fn fetch16(&mut self, addr: u32, seq: bool) -> u16 {
+        self.fetch_mode = Some(seq);
+        self.read16(addr)
+    }
+
+    /// Opcode fetch (32-bit, ARM).
+    #[inline]
+    pub fn fetch32(&mut self, addr: u32, seq: bool) -> u32 {
+        self.fetch_mode = Some(seq);
+        self.read32(addr)
+    }
+
+    /// Background-advance the prefetch unit by an instruction's elapsed cycles
+    /// (internal + non-ROM activity). Called once per instruction by the CPU.
+    #[inline]
+    pub fn prefetch_advance(&mut self, cycles: u32) {
+        self.prefetch.advance(cycles, Self::PREFETCH_MAX_CREDIT);
+    }
 
     /// Take and reset the accumulated memory-access cycles.
     #[inline]
@@ -990,6 +1112,7 @@ impl Bus {
                     eprintln!("[WAITCNT] 0x{:04X} -> 0x{:04X}  cyc={}", self.io.waitcnt, val, cyc);
                 }
                 self.io.waitcnt = val;
+                self.wait.update(val);
             }
             // HALTCNT (written via 0x04000301, 8-bit write)
             0x300 => self.io.postflg = val as u8,
