@@ -21,6 +21,10 @@ pub const CYCLES_PER_FRAME_SEQ: u32 = 32_768;
 /// Default 512 (k=0.5); used only for A/B experiments.
 static HF_K_NUM: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
 
+/// PSG-vs-DirectSound gain multiplier (default 2), cached from PSG_GAIN. See
+/// current_mix: corrects the PSG level to match mGBA's mixer balance.
+static PSG_GAIN_NUM: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+
 #[derive(Serialize, Deserialize)]
 pub struct Apu {
     // PSG channels
@@ -254,6 +258,20 @@ impl Apu {
         let psg_ratio = match self.psg_master_volume { 0 => 1, 1 => 2, _ => 4 };
         psg_left = psg_left * psg_ratio / 4;
         psg_right = psg_right * psg_ratio / 4;
+
+        // PSG-vs-DirectSound balance correction. Matching mGBA's exact mixer
+        // (src/gba/audio.c GBAAudioSample): one full PSG channel is ~0.234× a
+        // full DirectSound channel peak-to-peak, but our scaling above gives
+        // ~0.117× (our PSG is bipolar ±15 vs the GB unipolar 0..15, yet our DS
+        // and PSG absolute weights leave PSG 2× too quiet relative to DS). So
+        // PSG was under-represented — on M4A music that also drives the CGB/PSG
+        // channels (e.g. Castlevania HoD's menus) the DirectSound bass wrongly
+        // dominated. Scale PSG ×2 to match mGBA's balance. Env-tunable for A/B.
+        let g = PSG_GAIN_NUM.get_or_init(|| {
+            std::env::var("PSG_GAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+        });
+        psg_left *= *g;
+        psg_right *= *g;
 
         // FIFO channels (held values)
         let fifo_a = self.fifo_a.output() as i32;
