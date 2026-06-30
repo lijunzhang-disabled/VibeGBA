@@ -79,12 +79,11 @@ pub struct Apu {
     #[serde(default)]
     hp_out_r: i64,
 
-    // High-frequency emphasis (treble/sinc-compensation) state. VibeGBA emits
-    // sample-and-hold stairsteps then box-averages to 48 kHz; mGBA uses
-    // band-limited synthesis with no HF droop. The emu-agent's differential
-    // A/B vs mGBA measured a -5 dB rolloff above ~9 kHz (dull voice SFX), so we
-    // apply a first-order emphasis y[n] = x[n] + k*(x[n]-x[n-1]) that flattens
-    // it toward mGBA. serde(default) keeps old save states loadable.
+    // High-frequency emphasis (treble) state — now OFF by default (k=0). The
+    // sample-level A/B vs mGBA showed mGBA does NOT band-limit the FIFO; its HF
+    // tracks our zero-order-hold output, so the emphasis was over-boosting
+    // authentic imaging and adding quiet-passage hash. Kept env-tunable
+    // (HF_EMPHASIS_K) for A/B. serde(default) keeps old save states loadable.
     #[serde(default)]
     emph_prev_l: i64,
     #[serde(default)]
@@ -328,30 +327,32 @@ impl Apu {
         (yl, yr)
     }
 
-    /// First-order high-frequency emphasis: `y[n] = x[n] + k*(x[n]-x[n-1])`
-    /// with k = 0.25 (256/1024). Unity gain at DC (no effect on level/bass),
-    /// rising to ~+1.9 dB at 16 kHz — flattens the sample-and-hold + boxcar
-    /// HF rolloff toward mGBA.
+    /// First-order high-frequency emphasis: `y[n] = x[n] + k*(x[n]-x[n-1])`.
+    /// DEFAULT k = 0 (OFF). Kept as an env-tunable A/B knob (HF_EMPHASIS_K, out
+    /// of 1024) but no longer applied by default.
     ///
-    /// k history: 0.6 → 0.5 → 0.25. The deterministic, cycle-aligned song.gba
-    /// A/B vs mGBA (octave-band spectrum) gives max band dev: k=0.5 → 2.4 dB,
-    /// k=0.25 → 0.6 dB (best), k=0.125 → 1.1 dB, k=0 → 1.7 dB — so 0.5 was
-    /// over-tuned. It also amplifies the quiet-passage noise floor
-    /// (quantization/aliasing from the boxcar decimation): on HoD's save-file
-    /// menu, k=0.5 ran 2–3× mGBA's >8 kHz energy (audible hash), k=0.25 ~halves
-    /// it, k=0 matches mGBA. 0.25 is the global optimum — corrects the real
-    /// broadband rolloff without doubling the menu noise. The proper long-term
-    /// fix is a lower decimation noise floor (better anti-aliasing) so no
-    /// emphasis is needed; see debug notes.
+    /// Why off: the sample-level A/B vs mGBA (FIFO PCM peeked from both cores)
+    /// showed mGBA does NOT band-limit the DirectSound FIFO — its >8 kHz energy
+    /// tracks our plain zero-order-hold output (k=0) almost exactly across HoD's
+    /// menu, jump and attack (e.g. menu 1.9 vs 1.8 %, jump 1.6 vs 1.7 %, attack
+    /// 6.9 vs 7.0 %). The FIFO imaging is authentic GBA DAC behavior that mGBA
+    /// (and hardware) reproduce; the emphasis was *boosting* that authentic
+    /// content, which in quiet passages amplified the boxcar noise floor into
+    /// audible hash (reported on HoD's save-file menu). k history 0.6→0.5→0.25→0.
+    /// (Linear-interpolation band-limiting was tried and over-smoothed — it
+    /// drops the SFX far below mGBA — confirming ZOH/k=0 is the faithful model.)
+    /// Residual: song.gba is ~1.7 dB dull at k=0 — that's the boxcar decimation
+    /// rolloff, a separate issue not worth masking with noise-inducing emphasis.
     fn hf_emphasis(&mut self, xl: i64, xr: i64) -> (i64, i64) {
-        // k = 0.25 (256/1024) default; HF_EMPHASIS_K env overrides the numerator
-        // (out of 1024) for A/B experiments, e.g. HF_EMPHASIS_K=0 disables it.
+        // k = 0 (OFF) default; HF_EMPHASIS_K env overrides the numerator
+        // (out of 1024) for A/B experiments, e.g. HF_EMPHASIS_K=256 → k=0.25.
         const K_DEN: i64 = 1024;
         let k_num: i64 = HF_K_NUM.get_or_init(|| {
             std::env::var("HF_EMPHASIS_K").ok()
                 .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(256)
+                .unwrap_or(0)
         }).clone();
+        if k_num == 0 { return (xl, xr); }
         let yl = xl + k_num * (xl - self.emph_prev_l) / K_DEN;
         let yr = xr + k_num * (xr - self.emph_prev_r) / K_DEN;
         self.emph_prev_l = xl;
