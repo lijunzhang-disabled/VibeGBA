@@ -648,6 +648,21 @@ impl Bus {
         match addr >> 24 {
             0x02 => self.ewram[(addr & 0x3FFFF) as usize],
             0x03 => self.iwram[(addr & 0x7FFF) as usize],
+            0x04 => {
+                // Side-effect-free I/O reads for diagnostics. Sound registers
+                // (0x060-0x0A8) reconstruct from APU state via read_reg; other
+                // I/O returns 0 (extend as needed). Without this, peeking any
+                // I/O register returned 0, which made differential tracing of
+                // SOUNDCNT/PSG vs an oracle silently bogus.
+                let off = addr & 0x3FF;
+                match off {
+                    0x060..=0x0A9 => {
+                        let v = self.apu.read_reg(((off & !1) - 0x60) as u16);
+                        if off & 1 == 0 { v as u8 } else { (v >> 8) as u8 }
+                    }
+                    _ => 0,
+                }
+            }
             0x08..=0x0D => {
                 let offset = (addr & 0x01FF_FFFF) as usize;
                 if offset < self.rom.len() { self.rom[offset] } else { 0 }
