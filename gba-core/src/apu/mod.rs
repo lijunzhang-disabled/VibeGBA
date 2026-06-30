@@ -329,21 +329,28 @@ impl Apu {
     }
 
     /// First-order high-frequency emphasis: `y[n] = x[n] + k*(x[n]-x[n-1])`
-    /// with k = 0.5 (512/1024). Unity gain at DC (no effect on level/bass),
-    /// rising to ~+3.5 dB at 16 kHz — flattens the sample-and-hold + boxcar
-    /// HF rolloff toward mGBA. Originally fit to k=0.6 on title music, then
-    /// trimmed to 0.5: the emu-agent's same-room HoD attack-SFX A/B vs mGBA
-    /// showed k=0.6 ran ~+3–4 dB hot in 2–12 kHz on transients (and Golden
-    /// Sun's top octave likewise), so 0.5 lands closer to mGBA without
-    /// re-muffling the voice. (k=0.75 made 3–9 kHz clearly too bright.)
+    /// with k = 0.25 (256/1024). Unity gain at DC (no effect on level/bass),
+    /// rising to ~+1.9 dB at 16 kHz — flattens the sample-and-hold + boxcar
+    /// HF rolloff toward mGBA.
+    ///
+    /// k history: 0.6 → 0.5 → 0.25. The deterministic, cycle-aligned song.gba
+    /// A/B vs mGBA (octave-band spectrum) gives max band dev: k=0.5 → 2.4 dB,
+    /// k=0.25 → 0.6 dB (best), k=0.125 → 1.1 dB, k=0 → 1.7 dB — so 0.5 was
+    /// over-tuned. It also amplifies the quiet-passage noise floor
+    /// (quantization/aliasing from the boxcar decimation): on HoD's save-file
+    /// menu, k=0.5 ran 2–3× mGBA's >8 kHz energy (audible hash), k=0.25 ~halves
+    /// it, k=0 matches mGBA. 0.25 is the global optimum — corrects the real
+    /// broadband rolloff without doubling the menu noise. The proper long-term
+    /// fix is a lower decimation noise floor (better anti-aliasing) so no
+    /// emphasis is needed; see debug notes.
     fn hf_emphasis(&mut self, xl: i64, xr: i64) -> (i64, i64) {
-        // k = 0.5 (512/1024) default; HF_EMPHASIS_K env overrides the numerator
+        // k = 0.25 (256/1024) default; HF_EMPHASIS_K env overrides the numerator
         // (out of 1024) for A/B experiments, e.g. HF_EMPHASIS_K=0 disables it.
         const K_DEN: i64 = 1024;
         let k_num: i64 = HF_K_NUM.get_or_init(|| {
             std::env::var("HF_EMPHASIS_K").ok()
                 .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(512)
+                .unwrap_or(256)
         }).clone();
         let yl = xl + k_num * (xl - self.emph_prev_l) / K_DEN;
         let yr = xr + k_num * (xr - self.emph_prev_r) / K_DEN;
