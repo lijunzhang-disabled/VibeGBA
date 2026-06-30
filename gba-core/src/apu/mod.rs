@@ -21,6 +21,10 @@ pub const CYCLES_PER_FRAME_SEQ: u32 = 32_768;
 /// Default 512 (k=0.5); used only for A/B experiments.
 static HF_K_NUM: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
 
+/// PSG-vs-DirectSound gain multiplier (default 2), cached from PSG_GAIN. See
+/// current_mix: corrects the PSG level to match mGBA's mixer balance.
+static PSG_GAIN_NUM: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+
 #[derive(Serialize, Deserialize)]
 pub struct Apu {
     // PSG channels
@@ -79,12 +83,11 @@ pub struct Apu {
     #[serde(default)]
     hp_out_r: i64,
 
-    // High-frequency emphasis (treble/sinc-compensation) state. VibeGBA emits
-    // sample-and-hold stairsteps then box-averages to 48 kHz; mGBA uses
-    // band-limited synthesis with no HF droop. The emu-agent's differential
-    // A/B vs mGBA measured a -5 dB rolloff above ~9 kHz (dull voice SFX), so we
-    // apply a first-order emphasis y[n] = x[n] + k*(x[n]-x[n-1]) that flattens
-    // it toward mGBA. serde(default) keeps old save states loadable.
+    // High-frequency emphasis (treble) state — now OFF by default (k=0). The
+    // sample-level A/B vs mGBA showed mGBA does NOT band-limit the FIFO; its HF
+    // tracks our zero-order-hold output, so the emphasis was over-boosting
+    // authentic imaging and adding quiet-passage hash. Kept env-tunable
+    // (HF_EMPHASIS_K) for A/B. serde(default) keeps old save states loadable.
     #[serde(default)]
     emph_prev_l: i64,
     #[serde(default)]
@@ -256,6 +259,20 @@ impl Apu {
         psg_left = psg_left * psg_ratio / 4;
         psg_right = psg_right * psg_ratio / 4;
 
+        // PSG-vs-DirectSound balance correction. Matching mGBA's exact mixer
+        // (src/gba/audio.c GBAAudioSample): one full PSG channel is ~0.234× a
+        // full DirectSound channel peak-to-peak, but our scaling above gives
+        // ~0.117× (our PSG is bipolar ±15 vs the GB unipolar 0..15, yet our DS
+        // and PSG absolute weights leave PSG 2× too quiet relative to DS). So
+        // PSG was under-represented — on M4A music that also drives the CGB/PSG
+        // channels (e.g. Castlevania HoD's menus) the DirectSound bass wrongly
+        // dominated. Scale PSG ×2 to match mGBA's balance. Env-tunable for A/B.
+        let g = PSG_GAIN_NUM.get_or_init(|| {
+            std::env::var("PSG_GAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+        });
+        psg_left *= *g;
+        psg_right *= *g;
+
         // FIFO channels (held values)
         let fifo_a = self.fifo_a.output() as i32;
         let fifo_b = self.fifo_b.output() as i32;
@@ -328,23 +345,32 @@ impl Apu {
         (yl, yr)
     }
 
-    /// First-order high-frequency emphasis: `y[n] = x[n] + k*(x[n]-x[n-1])`
-    /// with k = 0.5 (512/1024). Unity gain at DC (no effect on level/bass),
-    /// rising to ~+3.5 dB at 16 kHz — flattens the sample-and-hold + boxcar
-    /// HF rolloff toward mGBA. Originally fit to k=0.6 on title music, then
-    /// trimmed to 0.5: the emu-agent's same-room HoD attack-SFX A/B vs mGBA
-    /// showed k=0.6 ran ~+3–4 dB hot in 2–12 kHz on transients (and Golden
-    /// Sun's top octave likewise), so 0.5 lands closer to mGBA without
-    /// re-muffling the voice. (k=0.75 made 3–9 kHz clearly too bright.)
+    /// First-order high-frequency emphasis: `y[n] = x[n] + k*(x[n]-x[n-1])`.
+    /// DEFAULT k = 0 (OFF). Kept as an env-tunable A/B knob (HF_EMPHASIS_K, out
+    /// of 1024) but no longer applied by default.
+    ///
+    /// Why off: the sample-level A/B vs mGBA (FIFO PCM peeked from both cores)
+    /// showed mGBA does NOT band-limit the DirectSound FIFO — its >8 kHz energy
+    /// tracks our plain zero-order-hold output (k=0) almost exactly across HoD's
+    /// menu, jump and attack (e.g. menu 1.9 vs 1.8 %, jump 1.6 vs 1.7 %, attack
+    /// 6.9 vs 7.0 %). The FIFO imaging is authentic GBA DAC behavior that mGBA
+    /// (and hardware) reproduce; the emphasis was *boosting* that authentic
+    /// content, which in quiet passages amplified the boxcar noise floor into
+    /// audible hash (reported on HoD's save-file menu). k history 0.6→0.5→0.25→0.
+    /// (Linear-interpolation band-limiting was tried and over-smoothed — it
+    /// drops the SFX far below mGBA — confirming ZOH/k=0 is the faithful model.)
+    /// Residual: song.gba is ~1.7 dB dull at k=0 — that's the boxcar decimation
+    /// rolloff, a separate issue not worth masking with noise-inducing emphasis.
     fn hf_emphasis(&mut self, xl: i64, xr: i64) -> (i64, i64) {
-        // k = 0.5 (512/1024) default; HF_EMPHASIS_K env overrides the numerator
-        // (out of 1024) for A/B experiments, e.g. HF_EMPHASIS_K=0 disables it.
+        // k = 0 (OFF) default; HF_EMPHASIS_K env overrides the numerator
+        // (out of 1024) for A/B experiments, e.g. HF_EMPHASIS_K=256 → k=0.25.
         const K_DEN: i64 = 1024;
         let k_num: i64 = HF_K_NUM.get_or_init(|| {
             std::env::var("HF_EMPHASIS_K").ok()
                 .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(512)
+                .unwrap_or(0)
         }).clone();
+        if k_num == 0 { return (xl, xr); }
         let yl = xl + k_num * (xl - self.emph_prev_l) / K_DEN;
         let yr = xr + k_num * (xr - self.emph_prev_r) / K_DEN;
         self.emph_prev_l = xl;

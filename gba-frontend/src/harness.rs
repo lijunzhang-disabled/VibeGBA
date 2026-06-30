@@ -183,6 +183,11 @@ impl Harness {
         for _ in 0..frames {
             gba.set_keypad_state(buttons);
             gba.run_cycles(CYCLES_PER_FRAME);
+            if std::env::var("PC_SAMPLE").is_ok() {
+                eprintln!("[PC] frame={} pc=0x{:08X} halted={} thumb={} ie=0x{:04X} ir=0x{:04X}",
+                    self.frame_index, gba.cpu.regs[15], gba.cpu.halted,
+                    gba.cpu.cpsr.thumb(), gba.bus.interrupt.ie, gba.bus.interrupt.ir);
+            }
             // Drain audio every frame so the APU's bounded buffer never
             // overflows across a multi-frame step.
             loop {

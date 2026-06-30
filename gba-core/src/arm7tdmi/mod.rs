@@ -308,6 +308,11 @@ impl Cpu {
         let mem_cycles = bus.take_mem_cycles();
         let total = cycles + prior_mem_cycles + mem_cycles + irq_entry_cycles;
 
+        // Background-advance the prefetch unit by this instruction's elapsed
+        // cycles, so sequential ROM code stays fast (the buffer keeps up) while
+        // branches/ROM-data accesses still pay the non-sequential penalty.
+        bus.prefetch_advance(total);
+
         // CYCLE_PROFILE: count cycles per mode for diagnostics (env-gated,
         // OnceLock — compiles to a single relaxed load + branch when off).
         if cycle_profile_enabled() {
@@ -456,14 +461,14 @@ impl Cpu {
     #[inline]
     fn advance_arm_pipeline(&mut self, bus: &mut Bus) {
         self.pipeline[0] = self.pipeline[1];
-        self.pipeline[1] = bus.read32(self.regs[15]);
+        self.pipeline[1] = bus.fetch32(self.regs[15], true); // sequential fetch
         self.regs[15] = self.regs[15].wrapping_add(4);
     }
 
     #[inline]
     fn advance_thumb_pipeline(&mut self, bus: &mut Bus) {
         self.pipeline[0] = self.pipeline[1];
-        self.pipeline[1] = bus.read16(self.regs[15]) as u32;
+        self.pipeline[1] = bus.fetch16(self.regs[15], true) as u32; // sequential
         self.regs[15] = self.regs[15].wrapping_add(2);
     }
 
@@ -478,14 +483,14 @@ impl Cpu {
             // refill targets a different region than the previous step
             // (e.g. an IRQ entry jumping from ROM to BIOS 0x18).
             bus.last_pc = pc;
-            self.pipeline[0] = bus.read16(pc) as u32;
-            self.pipeline[1] = bus.read16(pc + 2) as u32;
+            self.pipeline[0] = bus.fetch16(pc, false) as u32; // non-sequential (branch)
+            self.pipeline[1] = bus.fetch16(pc + 2, true) as u32; // sequential
             self.regs[15] = pc + 4;
         } else {
             let pc = self.regs[15] & !3;
             bus.last_pc = pc;
-            self.pipeline[0] = bus.read32(pc);
-            self.pipeline[1] = bus.read32(pc + 4);
+            self.pipeline[0] = bus.fetch32(pc, false); // non-sequential (branch)
+            self.pipeline[1] = bus.fetch32(pc + 4, true); // sequential
             self.regs[15] = pc + 8;
         }
         self.pipeline_flushed = false;
