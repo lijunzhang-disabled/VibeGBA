@@ -983,8 +983,21 @@ impl Bus {
                 let offset = (addr & 0x3FF) - 0x60;
                 self.apu.read_reg(offset as u16)
             }
-            // DMA (write-only except for control which returns current state)
-            0x0B0..=0x0DE => 0, // TODO: DMA register reads
+            // DMA registers. Source/dest/word-count (DMAxSAD/DAD/CNT_L) are
+            // write-only and read back as 0. The control halfword (DMAxCNT_H,
+            // at 0xBA/0xC6/0xD2/0xDE) IS readable and returns the current
+            // control bits. Games' sound engines restart the FIFO DMAs via a
+            // read-modify-write of DMAxCNT_H (LDRH; BIC #0x8000; STRH; LDRH;
+            // ORR #0x8000; STRH). Returning 0 here dropped the timing/dest
+            // bits, turning a Special-timing/fixed-dest FIFO DMA into an
+            // Immediate/incrementing one that sprayed the sound buffer across
+            // the whole I/O block — corrupting IE/IME and hanging the game
+            // (KOF EX2: white screen). See DMAxCNT_H layout in GBATEK.
+            0x0BA => self.dma.channels[0].control,
+            0x0C6 => self.dma.channels[1].control,
+            0x0D2 => self.dma.channels[2].control,
+            0x0DE => self.dma.channels[3].control,
+            0x0B0..=0x0DD => 0, // DMAxSAD/DAD/CNT_L: write-only
             // Timers
             0x100 => self.timers.read_counter(0),
             0x102 => self.timers.timers[0].control,
