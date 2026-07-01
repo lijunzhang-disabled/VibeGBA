@@ -13,12 +13,15 @@ pub enum BackupMedia {
 }
 
 impl BackupMedia {
-    pub fn read(&self, addr: u32) -> u8 {
+    /// Read a byte from the backup chip. Takes `&mut self` because EEPROM reads
+    /// have a side effect: each read shifts out the next serial bit. SRAM/Flash
+    /// reads are side-effect free.
+    pub fn read(&mut self, addr: u32) -> u8 {
         match self {
             BackupMedia::None => 0xFF,
             BackupMedia::Sram(s) => s.read(addr),
             BackupMedia::Flash(f) => f.read(addr),
-            BackupMedia::Eeprom(e) => e.read(addr),
+            BackupMedia::Eeprom(e) => e.read_bit(),
         }
     }
 

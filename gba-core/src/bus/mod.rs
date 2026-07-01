@@ -353,7 +353,9 @@ impl Bus {
             0x05 => self.palette[(addr & 0x3FF) as usize],
             0x06 => self.read_vram8(addr),
             0x07 => self.oam[(addr & 0x3FF) as usize],
-            0x08..=0x0D => self.read_rom8(addr),
+            0x08..=0x0C => self.read_rom8(addr),
+            0x0D if self.eeprom_access(addr) => self.backup.read(0),
+            0x0D => self.read_rom8(addr),
             0x0E..=0x0F => self.backup.read(addr & 0xFFFF),
             _ => (self.last_read & 0xFF) as u8,
         };
@@ -390,7 +392,10 @@ impl Bus {
                 let base = (addr & 0x3FF) as usize;
                 u16::from_le_bytes([self.oam[base], self.oam[base + 1]])
             }
-            0x08..=0x0D => self.read_rom16(addr),
+            0x08..=0x0C => self.read_rom16(addr),
+            // EEPROM returns a single serial bit (in bit 0) per halfword read.
+            0x0D if self.eeprom_access(addr) => self.backup.read(0) as u16,
+            0x0D => self.read_rom16(addr),
             0x0E..=0x0F => {
                 // SRAM/Flash is on an 8-bit bus: 16-bit reads broadcast the
                 // single byte to both halves of the result.
@@ -455,6 +460,8 @@ impl Bus {
                     self.oam[base + 3],
                 ])
             }
+            // EEPROM is a 1-bit serial device; a 32-bit read yields one bit.
+            0x0D if self.eeprom_access(addr) => self.backup.read(0) as u32,
             0x08..=0x0D => {
                 let lo = self.read_rom16(addr) as u32;
                 let hi = self.read_rom16(addr + 2) as u32;
@@ -509,6 +516,11 @@ impl Bus {
             // 8-bit OAM writes are ignored
             0x07 => {}
             0x08..=0x0D => {
+                // EEPROM serial input: one bit (LSB) per write.
+                if self.eeprom_access(addr) {
+                    self.backup.write(0, val);
+                    return;
+                }
                 // GPIO byte writes — forward to RTC. Games rarely write 8-bit to GPIO
                 // but we handle it by reading the current 16-bit value and merging.
                 if self.rtc.enabled {
@@ -577,6 +589,12 @@ impl Bus {
                 self.oam[base + 1] = bytes[1];
             }
             0x08..=0x0D => {
+                // EEPROM serial input: DMA feeds the command/data stream one
+                // bit (LSB) per halfword write.
+                if self.eeprom_access(addr) {
+                    self.backup.write(0, val as u8);
+                    return;
+                }
                 // Cartridge writes — only handled for GPIO (RTC) registers.
                 if self.rtc.enabled {
                     let rel = addr & 0x01FF_FFFE;
@@ -690,6 +708,28 @@ impl Bus {
         self.backup.tick(cycles);
     }
 
+    /// True if `addr` (in the gamepak region) targets EEPROM rather than ROM.
+    ///
+    /// EEPROM lives in region 0x0D. On carts ≤16 MB the whole region maps to
+    /// the chip; on larger carts (where ROM data reaches into 0x0D) only the
+    /// top 256 bytes (0x0DFFFF00-0x0DFFFFFF) do, so ROM stays reachable. The
+    /// EEPROM protocol ignores the byte address, so the exact offset doesn't
+    /// matter — only whether the access is routed to the chip.
+    #[inline]
+    fn eeprom_access(&self, addr: u32) -> bool {
+        if !matches!(self.backup, BackupMedia::Eeprom(_)) {
+            return false;
+        }
+        if (addr >> 24) != 0x0D {
+            return false;
+        }
+        if self.rom.len() > 0x0100_0000 {
+            addr >= 0x0DFF_FF00
+        } else {
+            true
+        }
+    }
+
     // ─── DMA execution ─────────────────────────────────────────────
 
     /// Execute a DMA transfer for the given channel.
@@ -774,6 +814,16 @@ impl Bus {
 
         let mut src = ch.internal_sad;
         let mut dst = ch.internal_dad;
+
+        // EEPROM is driven by DMA. A command-stream DMA (destination = EEPROM)
+        // encodes the chip's address width in its unit count; latch it before
+        // the transfer feeds the first bits so the address phase uses the right
+        // width. (`ch`'s borrow of self.dma ends above, so self is free here.)
+        if self.eeprom_access(dst) {
+            if let BackupMedia::Eeprom(e) = &mut self.backup {
+                e.set_addr_width_from_dma(count);
+            }
+        }
 
         if is_fifo {
             // FIFO: transfer 4 x 32-bit words, dest fixed, src increments.
