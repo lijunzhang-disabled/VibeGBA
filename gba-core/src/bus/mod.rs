@@ -695,6 +695,35 @@ impl Bus {
     /// Execute a DMA transfer for the given channel.
     /// Called directly on Bus since it owns both DMA state and memory.
     /// Returns (cycles, irq_requested).
+    /// Cycle cost of one 4×32-bit FIFO (sound) DMA transfer, computed exactly
+    /// as mGBA does (src `src`, dest fixed at a FIFO I/O register in region 4).
+    ///
+    /// Per-unit cost = 2 (DMA internal) + N32[src/dst] (first unit) or
+    /// S32[src/dst] (subsequent), plus a 2-cycle tail because the destination
+    /// (I/O, region 4) is below the ROM region. Region 4 (I/O) has 0 extra
+    /// wait, so only the source region contributes. For ROM source the 16-bit
+    /// wait values combine as N32 = N16+1+S16, S32 = 2·S16+1 (mGBA
+    /// adjustWaitstates); for the internal 32-bit buses (IWRAM/IO) N32=S32=0;
+    /// EWRAM's 16-bit bus is N32=S32=5.
+    ///   total = unit1 + 3·unitN + 2
+    pub fn fifo_dma_cost(&self, src: u32) -> u32 {
+        let region = (src >> 24) & 0x0F;
+        let (n32, s32) = match region {
+            0x08..=0x0D => {
+                let r = WaitTable::rom_region(src);
+                let n = self.wait.rom_n16[r];
+                let s = self.wait.rom_s16[r];
+                (3 + n + s, 3 + 2 * s)
+            }
+            0x02 => (5, 5),         // EWRAM (16-bit bus)
+            0x05 | 0x06 => (1, 1),  // palette/VRAM (16-bit bus)
+            _ => (0, 0),            // IWRAM / I/O / OAM / BIOS (32-bit bus)
+        };
+        let unit1 = 2 + n32;
+        let unitn = 2 + s32;
+        unit1 + 3 * unitn + 2
+    }
+
     pub fn run_dma(&mut self, channel_id: usize) -> (u32, bool) {
         use crate::dma::AddrControl;
 
@@ -747,7 +776,28 @@ impl Bus {
         let mut dst = ch.internal_dad;
 
         if is_fifo {
-            // FIFO: transfer 4 x 32-bit words, dest fixed, src increments
+            // FIFO: transfer 4 x 32-bit words, dest fixed, src increments.
+            if crate::dma_steal_enabled() {
+                // Cycle-stealing path: account the transfer's real hardware
+                // cost (from the source region, computed BEFORE `src`
+                // increments) as an explicit CPU stall. The bus read32/write32
+                // below would otherwise leak data-wait-state cycles into the
+                // CPU's mem_access_cycles accumulator (mis-attributed to the
+                // next instruction); snapshot+restore so they don't double-count.
+                let cost = self.fifo_dma_cost(src);
+                let saved_mem_cycles = self.mem_access_cycles;
+                for _ in 0..4 {
+                    let val = self.read32(src);
+                    self.write32(dst, val);
+                    src = src.wrapping_add(4);
+                }
+                self.mem_access_cycles = saved_mem_cycles;
+                self.dma.channels[channel_id].internal_sad = src;
+                return (cost, irq_on_done);
+            }
+            // Legacy path (default): flat 4-cycle cost; the read32/write32
+            // wait-state cycles fold into the CPU accumulator as before. This
+            // preserves the audio-oracle-validated default timing exactly.
             for _ in 0..4 {
                 let val = self.read32(src);
                 self.write32(dst, val);

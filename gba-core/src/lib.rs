@@ -58,6 +58,18 @@ pub fn diagnostics_active() -> bool {
     })
 }
 
+/// Whether FIFO-sound DMA steals CPU cycles (re-ticked into the timers and
+/// added to the scheduler so a cycle-counting timer sees the stall). Models
+/// real hardware, where the DMA halts the CPU while moving words to the FIFO.
+/// Env-gated (DMA_STEAL=1) while the audio-oracle regression pass validates
+/// it; off preserves the prior flat-cost behavior exactly. See
+/// [[project_alyosha_fifo_dma]].
+pub fn dma_steal_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DMA_STEAL").is_ok())
+}
+
 pub fn cycle_profile_record(in_irq: bool, cycles: u32) {
     if in_irq {
         PROFILE_IRQ_CYCLES.fetch_add(cycles as u64, Ordering::Relaxed);
@@ -311,9 +323,12 @@ impl Gba {
                         // APU sees old FIFO state for `chunk` cycles
                         self.bus.apu.tick(chunk);
                         // Now advance scheduler + timers (may pop FIFO once
-                        // if we hit an overflow boundary)
+                        // if we hit an overflow boundary). The CPU is halted,
+                        // so a FIFO DMA here steals no CPU time — the idle gap
+                        // is already fixed by the next scheduler event; ignore
+                        // the stolen count.
                         self.scheduler.add_cycles(chunk as u64);
-                        self.tick_timers(chunk);
+                        let _ = self.tick_timers(chunk);
                         cycle_profile_record_halt(chunk as u64);
                         remaining -= chunk;
                     }
@@ -332,8 +347,13 @@ impl Gba {
                 let cycles = self.cpu.step(&mut self.bus) as u64;
                 self.scheduler.add_cycles(cycles);
 
-                // Tick timers and audio
-                self.tick_timers(cycles as u32);
+                // Tick timers and audio. FIFO DMA may steal extra bus cycles
+                // (CPU halted during the transfer); those advance wall-clock
+                // time too, so fold them into the scheduler.
+                let stolen = self.tick_timers(cycles as u32);
+                if stolen != 0 {
+                    self.scheduler.add_cycles(stolen as u64);
+                }
                 self.bus.apu.tick(cycles as u32);
 
                 // Handle pending SWI
@@ -529,14 +549,33 @@ impl Gba {
                     // each buffer. Skip the reset whenever the channel was
                     // latched within the last ~2 frames — that covers any
                     // game driving DMA at ≥30 Hz.
-                    const RECENT_LATCH_CYCLES: u64 = 2 * CYCLES_PER_FRAME as u64;
+                    // Skip the re-anchor for channels the game has latched
+                    // itself recently — those are self-driving their buffer and
+                    // must not be rewound. The window must exceed the game's
+                    // DMA re-latch period. Castlevania: Harmony of Dissonance
+                    // uses a 7-frame PCM double-buffer (pcmDmaPeriod=7) and
+                    // re-latches DMA1 every 7 frames; with the old 2-frame
+                    // window our re-anchor rewound HoD's buffer on 4 of every 7
+                    // frames, smearing/delaying the SFX attack (audible: jump
+                    // "shot" nearly vanished — output attack rms 3461 vs mGBA
+                    // 6170 at the transient; an 8-frame window restores 6451,
+                    // matching mGBA). Games that never re-latch (Pokémon
+                    // Emerald) are unaffected: their last latch is thousands of
+                    // frames old, far past any window, so they still re-anchor.
+                    // Env-tunable (REANCHOR_FRAMES) for A/B. Default 8 frames.
+                    static REANCHOR_FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                    let gate_frames = *REANCHOR_FRAMES.get_or_init(|| {
+                        std::env::var("REANCHOR_FRAMES").ok()
+                            .and_then(|v| v.parse().ok()).unwrap_or(8)
+                    });
+                    let recent_latch_cycles: u64 = gate_frames * CYCLES_PER_FRAME as u64;
                     let now = self.scheduler.timestamp();
                     for ch in [1usize, 2] {
                         let c = &mut self.bus.dma.channels[ch];
                         if !(c.active && matches!(c.timing(), dma::DmaTiming::Special)) {
                             continue;
                         }
-                        if now.saturating_sub(c.last_latch_cycle) <= RECENT_LATCH_CYCLES {
+                        if now.saturating_sub(c.last_latch_cycle) <= recent_latch_cycles {
                             continue;
                         }
                         if dma_audio_trace {
@@ -585,59 +624,88 @@ impl Gba {
     }
 
     /// Tick timers by the given number of CPU cycles.
-    fn tick_timers(&mut self, cycles: u32) {
-        let result = self.bus.timers.tick(cycles);
-
-        // Fire timer IRQs
+    /// Advance the timers by `cycles`, firing timer IRQs and timer-driven
+    /// FIFO-sound DMA. Returns the number of extra CPU cycles *stolen* by
+    /// FIFO DMA bus access during this span (0 unless DMA_STEAL is enabled).
+    ///
+    /// On hardware a FIFO DMA halts the CPU while it moves 4×32-bit words to
+    /// the FIFO register; the system clock (and thus the timers) keeps running
+    /// during that stall. We model this by re-ticking the timers with the DMA
+    /// cost — which can cascade (the stall pushes the FIFO timer past another
+    /// overflow, firing another DMA). The caller adds the returned total to the
+    /// scheduler so wall-clock time accounts for the stall.
+    fn tick_timers(&mut self, cycles: u32) -> u32 {
         const TIMER_IRQS: [interrupt::Irq; 4] = [
             interrupt::Irq::Timer0,
             interrupt::Irq::Timer1,
             interrupt::Irq::Timer2,
             interrupt::Irq::Timer3,
         ];
-        for i in 0..4 {
-            if result.irqs[i] {
-                self.bus.interrupt.request_irq(TIMER_IRQS[i]);
-            }
-        }
-
-        // Timer 0/1 overflow: advance FIFO samples and trigger DMA refill.
-        //
-        // CRITICAL: only fire the DMA channel whose destination address
-        // matches the FIFO that requested refill. Without this filter, an
-        // empty FIFO_B (which can stay empty if a game uses only FIFO_A)
-        // requests refill on every timer overflow → run_dma_for_timing
-        // would fire ALL Special-timed channels including DMA1, causing
-        // DMA1 to over-push samples to FIFO_A (which is already full).
-        // SRTOG hits this — observed DMA1 firing 352 ×/frame instead of
-        // the expected 22 ×/frame for its 21024 Hz sample rate.
+        // Only fire the DMA channel whose destination matches the FIFO that
+        // requested refill (see SRTOG note below).
         const FIFO_A_ADDR: u32 = 0x0400_00A0;
         const FIFO_B_ADDR: u32 = 0x0400_00A4;
 
-        if result.timer0_overflow {
-            let (fifo_a_refill, fifo_b_refill) = self.bus.apu.on_timer_overflow(0);
-            if fifo_a_refill { self.run_dma_for_fifo(FIFO_A_ADDR); }
-            if fifo_b_refill { self.run_dma_for_fifo(FIFO_B_ADDR); }
+        let steal = dma_steal_enabled();
+        let mut total_stolen = 0u32;
+        let mut pending = cycles;
+        // Cascade guard: a pathological timer (period < DMA cost) with a
+        // perpetually-starved FIFO could loop forever; bound it.
+        let mut guard = 0u32;
+
+        loop {
+            let result = self.bus.timers.tick(pending);
+
+            for i in 0..4 {
+                if result.irqs[i] {
+                    self.bus.interrupt.request_irq(TIMER_IRQS[i]);
+                }
+            }
+
+            // Timer 0/1 overflow: advance the FIFO sample and, if half-empty,
+            // run the matching FIFO DMA. CRITICAL: only the DMA whose dest is
+            // the requesting FIFO — else an always-empty FIFO_B would fire
+            // DMA1 (FIFO_A) on every overflow, over-pushing FIFO_A. SRTOG hit
+            // this (DMA1 firing 352×/frame vs the expected 22×).
+            let mut stolen = 0u32;
+            if result.timer0_overflow {
+                let (a, b) = self.bus.apu.on_timer_overflow(0);
+                if a { stolen += self.run_dma_for_fifo(FIFO_A_ADDR); }
+                if b { stolen += self.run_dma_for_fifo(FIFO_B_ADDR); }
+            }
+            if result.timer1_overflow {
+                let (a, b) = self.bus.apu.on_timer_overflow(1);
+                if a { stolen += self.run_dma_for_fifo(FIFO_A_ADDR); }
+                if b { stolen += self.run_dma_for_fifo(FIFO_B_ADDR); }
+            }
+
+            if !steal || stolen == 0 || guard >= 64 {
+                break;
+            }
+            // The CPU is stalled for `stolen` cycles; the APU and timers keep
+            // running. Re-tick the timers (cascade) and account the stall.
+            self.bus.apu.tick(stolen);
+            total_stolen += stolen;
+            pending = stolen;
+            guard += 1;
         }
-        if result.timer1_overflow {
-            let (fifo_a_refill, fifo_b_refill) = self.bus.apu.on_timer_overflow(1);
-            if fifo_a_refill { self.run_dma_for_fifo(FIFO_A_ADDR); }
-            if fifo_b_refill { self.run_dma_for_fifo(FIFO_B_ADDR); }
-        }
+        total_stolen
     }
 
     /// Run DMA channels in Special timing whose destination is the given
     /// FIFO register. Used by FIFO refill triggering so that a low FIFO_A
     /// only fires the DMA writing to FIFO_A, not arbitrary other Special
     /// channels.
-    fn run_dma_for_fifo(&mut self, fifo_addr: u32) {
+    fn run_dma_for_fifo(&mut self, fifo_addr: u32) -> u32 {
+        let mut cost_total = 0u32;
         for ch_id in 0..4 {
             let c = &self.bus.dma.channels[ch_id];
             if c.enabled() && c.active
                 && c.timing() == DmaTiming::Special
                 && (c.dad & 0x07FF_FFFF) == (fifo_addr & 0x07FF_FFFF)
             {
-                let (_cycles, irq) = self.bus.run_dma(ch_id);
+                let (cycles, irq) = self.bus.run_dma(ch_id);
+                cost_total += cycles;
                 if irq {
                     let irq_type = match ch_id {
                         0 => interrupt::Irq::Dma0,
@@ -656,6 +724,7 @@ impl Gba {
                 }
             }
         }
+        cost_total
     }
 
     /// Run all DMA channels that match a given timing trigger.

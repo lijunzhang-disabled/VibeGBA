@@ -5,6 +5,15 @@ use psg::{Channel1, Channel2, Channel3, Channel4};
 use fifo::FifoChannel;
 use serde::{Deserialize, Serialize};
 
+/// Whether to enforce the hardware quirk that FIFO writes while the sound
+/// master enable (SOUNDCNT_X.7) is clear load nothing. Env-gated
+/// (FIFO_MASTER_GATE=1) during the cycle-accurate FIFO-DMA validation.
+fn fifo_master_gate() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("FIFO_MASTER_GATE").is_ok())
+}
+
 /// Output sample rate delivered to the frontend.
 /// Chosen to match the macOS Core Audio native rate (48 kHz) so SDL2 does
 /// not need to resample internally — that resampling is a major source of
@@ -562,7 +571,12 @@ impl Apu {
                 if idx < 32 { self.ch3.wave_ram[idx] = bytes[0]; }
                 if idx + 1 < 32 { self.ch3.wave_ram[idx + 1] = bytes[1]; }
             }
-            // FIFO_A low (0xA0) and high (0xA2) halves — each writes 2 samples
+            // FIFO_A low (0xA0) and high (0xA2) halves — each writes 2 samples.
+            // Hardware quirk (alyosha fifo.gba t002): while the master enable
+            // (SOUNDCNT_X.7) is clear, the sound registers — including the
+            // FIFO — are not writable, so writes load nothing. Env-gated while
+            // the cycle-accurate FIFO-DMA work is validated.
+            0x40 | 0x42 | 0x44 | 0x46 if fifo_master_gate() && !self.master_enable => {}
             0x40 => self.fifo_a.write16(value),
             0x42 => self.fifo_a.write16(value),
             // FIFO_B low (0xA4) and high (0xA6)
