@@ -39,7 +39,7 @@ write to 0xBC →   channel.sad ────latch───→  channel.internal_
 
 ### Why two registers?
 
-**1. Software can read back what it programmed.** If a game does `STR R0, [DMA1SAD]` then later `LDR R1, [DMA1SAD]`, it expects `R1 == R0`. If `sad` advanced during the transfer, that read would return some random mid-transfer position. Real hardware preserves the programmed value by keeping it separate from the cursor.
+**1. The programmed value is the "ground truth" to snap back to.** The cursor has to advance during a transfer, but the value the game programmed must survive so it can be reloaded on repeat/re-trigger. If there were only one register, a repeating channel would have no start-of-buffer to return to after the cursor walked off the end. Keeping `sad` frozen and advancing a separate `internal_sad` preserves that ground truth. (Note: on the GBA the programmed `SAD`/`DAD`/`CNT_L` registers are *write-only* — a game can't `LDR` them back at all; they read as 0. So this isn't about software read-back, it's purely internal bookkeeping. The one DMA register that *is* readable is `CNT_H` — see "Register readability" below.)
 
 **2. Repeat / re-trigger semantics.** When DMA repeats, the controller can reload `internal_count` from `count` (and optionally `internal_dad` from `dad`) without losing what was programmed. The cursor advances during transfers; the programmed register is the "ground truth" you snap back to. The whole trick of `SoundDriverVSync` (see [fifo-dma-vblank.md](fifo-dma-vblank.md)) relies on this: it forces a re-latch of `internal_sad` from `sad` to snap the cursor back to the start of the buffer.
 
@@ -73,6 +73,32 @@ So a game's lifecycle for DMA1 looks like:
 
 `sad` is what the game programmed. `internal_sad` is where the controller is *currently* reading from. The same applies to `dad`/`internal_dad` and `count`/`internal_count`.
 
+## Register readability (and the trap it hides)
+
+Not all DMA registers are readable. Per GBATEK:
+
+| Register | Addr (DMA1) | Access |
+|---|---|---|
+| `SAD` | `0x0BC` | **write-only** (reads 0) |
+| `DAD` | `0x0C0` | **write-only** (reads 0) |
+| `CNT_L` (word count) | `0x0C4` | **write-only** (reads 0) |
+| `CNT_H` (control) | `0x0C6` | **read/write** |
+
+Only the control halfword `CNT_H` reads back its current bits (`0xBA`/`0xC6`/`0xD2`/`0xDE` for DMA0–3). The address and count registers read as 0.
+
+This matters because sound engines **restart** their FIFO DMAs with a read-modify-write of `CNT_H` — clear the enable bit, then set it again to force a re-latch:
+
+```asm
+LDRH  r0, [CNT_H]      ; read current control
+BIC   r0, r0, #0x8000  ; clear enable
+STRH  r0, [CNT_H]      ; disable
+LDRH  r0, [CNT_H]      ; read again
+ORR   r0, r0, #0x8000  ; set enable
+STRH  r0, [CNT_H]      ; re-enable → 0→1 edge re-latches internal_sad
+```
+
+If `CNT_H` reads back 0 instead of its real bits, the write-back drops the timing bits (`Special`/FIFO), the dest-control bits (`Fixed`), repeat, etc. — so re-enabling produces enable + `Immediate` timing + incrementing destination. That fires a runaway transfer that walks the whole I/O block, corrupting `IE`/`IME` and hanging the game. This was the King of Fighters EX2 white-screen bug — see [../2026-07-01_kof-ex2-dmacnt-readable.md](../2026-07-01_kof-ex2-dmacnt-readable.md). The moral: for a register whose *documented* behaviour is "readable", a stub `=> 0` is not a safe placeholder — games do read-modify-write on it.
+
 ## How GBA DMA differs from modern submission-queue DMA
 
 If your mental model comes from NVMe / PCIe DMA / modern NPUs/GPUs, the GBA looks very minimalist:
@@ -105,4 +131,5 @@ GBA is from 2001, ARM7TDMI-based, ~16.78 MHz, with 384 KB total internal memory.
 
 - [fifo-dma-vblank.md](fifo-dma-vblank.md) — uses the `sad` vs `internal_sad` distinction to explain why we re-anchor sound DMA every VBlank.
 - [blanking-periods.md](blanking-periods.md) — VBlank timing, the recurring trigger that drives the sound DMA reset.
+- [../2026-07-01_kof-ex2-dmacnt-readable.md](../2026-07-01_kof-ex2-dmacnt-readable.md) — the CNT_H read-back bug that motivated the "Register readability" section.
 - `gba-core/src/dma.rs` — the actual implementation.
