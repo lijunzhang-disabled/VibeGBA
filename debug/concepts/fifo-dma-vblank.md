@@ -49,18 +49,23 @@ Rather than guess at the missing path, we do the safe thing: at every VBlank, in
 
 A naïve unconditional re-anchor breaks games that legitimately stream audio across multiple frames without re-anchoring per-VBlank. The clearest example is [velipso's gba-sound-demo](https://github.com/velipso/gba-sound-demo) `rates.gba` in the timer-driven modes (`16K*` / `32K*` / `65K*`): the demo sets up a separate Timer 1 that fires an IRQ every 311,296 cycles (≈ 1.114 frames), and the IRQ handler disables DMA1/2, writes new `SAD` values pointing at the next buffer, and re-enables — relying on the natural 0→1 enable latch to install the new source. The buffer takes ~1.114 frames to play, so a VBlank fires partway through each buffer. If we re-anchor on that VBlank we rewind `internal_sad` to the start of the current buffer, audibly looping the first ~16 ms of each buffer.
 
-So the re-anchor is gated: we record `last_latch_cycle` on each 0→1 enable transition (`DmaChannel.last_latch_cycle`, set in `DmaController::write_control`), and at VBlank we **skip** the re-anchor for any channel whose last latch was within the last ~2 frames. The threshold (`2 * CYCLES_PER_FRAME`) is wide enough to cover any game driving DMA at ≥ 30 Hz, and tight enough to catch Pokémon (which has `last_latch_cycle == 0` forever and is always outside the window).
+So the re-anchor is gated: we record `last_latch_cycle` on each 0→1 enable transition (`DmaChannel.last_latch_cycle`, set in `DmaController::write_control`), and at VBlank we **skip** the re-anchor for any channel whose last latch was within the last **8 frames** (`REANCHOR_FRAMES`, default 8). A channel latched recently is one the game is actively driving; we must leave its read cursor alone. Only Pokémon-style channels — `last_latch_cycle` set once at boot and never again, thousands of frames stale — fall outside the window and get re-anchored.
+
+**Why 8 frames, and the bug that set it there.** The threshold must comfortably exceed the largest M4A `pcmDmaPeriod` in common use. M4A double-buffers its PCM output over `pcmDmaPeriod` frames and re-latches DMA1 on that cadence; Castlevania: Harmony of Dissonance and Pokémon Emerald both use `pcmDmaPeriod = 7`, re-latching every **7 frames**. The gate was originally hardcoded at `2 * CYCLES_PER_FRAME` — tuned only against Pokémon (never re-latches) and velipso (~1.1-frame period), never against the 7-frame M4A cadence. With the 2-frame window, on the 4 of every 7 frames where HoD's last self-latch was 3–6 frames old, our re-anchor fired *mid-buffer* and rewound `internal_sad` to the start, overwriting/delaying the freshly-written samples before the FIFO reached them. Audibly this smeared short SFX transients into the noise floor (HoD's jump "shot" nearly vanished; attack-frame output RMS 3461 vs mGBA's 6170). Widening to 8 frames puts a game's own 7-frame re-latch safely inside the window (one frame of margin). See `../2026-07-01_hod-emerald-m4a-sfx-smearing.md`.
 
 Decision table:
 
 | Game class | `last_latch_cycle` per VBlank | Action |
 |---|---|---|
-| Pokémon Emerald: no DMA writes after boot | stale (set once at boot) | re-anchor ✓ |
+| Pokémon Emerald: no DMA writes after boot* | stale (set once at boot) | re-anchor ✓ |
+| M4A `pcmDmaPeriod = N` (HoD, Emerald: N=7): re-latch every N frames | always within N ≤ 8 frames | skip — game's own re-latch drives delivery |
 | Most M4A games: SWI 0x1D every frame | always within 1 frame | skip — SWI 0x1D already re-latched |
 | velipso 16K*/32K*/65K*: IRQ buffer swap every ~1.1 frames | always within ~1.1 frames | skip — game's own swap handles it |
-| velipso 13K (VBlank-paced) | one-shot setup, no re-toggle | re-anchor ✓ (buffer is exactly 1 frame, same as M4A) |
+| velipso 13K (VBlank-paced) | one-shot setup, no re-toggle | re-anchor ✓ (buffer is exactly 1 frame) |
 
-If you ever find a game whose audio breaks because of this auto-reset (e.g. a game intentionally lets DMA stream through a long contiguous buffer without resetting *and* without re-latching often enough to stay in the recency window), the right fix is to trace down why the game's expected reset path isn't running, rather than widen the threshold further.
+*Emerald reaches the FIFO both ways in practice — its 7-frame re-latch keeps it inside the gate on most VBlanks (so it's skipped like any M4A game), and the earlier "never re-latches" framing was imprecise. The important invariant is that any game actively driving DMA at a period ≤ 8 frames is left alone.
+
+If you ever find a game whose audio breaks because of this auto-reset (e.g. a game with `pcmDmaPeriod > 8`, or one that intentionally streams DMA through a long contiguous buffer without re-latching often enough to stay in the window), first confirm its re-latch period with `examples/dma1_latch_probe.rs`. If it genuinely re-latches on a period the game controls, widening `REANCHOR_FRAMES` past that period is the correct fix (that's exactly what the 2→8 change was). If it never re-latches yet still breaks, trace down why its expected reset path isn't running instead.
 
 ### Known residual: velipso `*` modes crackle even after the gate
 
@@ -102,12 +107,13 @@ Here the walking source pointer is the **whole point**. After 160 lines, the gam
 Hence our reset is filtered to `Special` timing only, AND gated on latch recency:
 
 ```rust
-const RECENT_LATCH_CYCLES: u64 = 2 * CYCLES_PER_FRAME as u64;
+// REANCHOR_FRAMES env-tunable, default 8 (must exceed max M4A pcmDmaPeriod).
+let recent_latch_cycles: u64 = gate_frames * CYCLES_PER_FRAME as u64;
 let now = self.scheduler.timestamp();
 for ch in [1usize, 2] {
     let c = &mut self.bus.dma.channels[ch];
     if !(c.active && matches!(c.timing(), dma::DmaTiming::Special)) { continue; }
-    if now.saturating_sub(c.last_latch_cycle) <= RECENT_LATCH_CYCLES { continue; }
+    if now.saturating_sub(c.last_latch_cycle) <= recent_latch_cycles { continue; }
     c.internal_sad = c.sad & 0x07FF_FFFF;
 }
 ```
@@ -127,3 +133,4 @@ We don't touch HBlank-timed DMA channels (the HDMA scroll-table use case would b
 - [blanking-periods.md](blanking-periods.md) — what VBlank actually is.
 - [scheduler.md](scheduler.md) — how the VBlank moment is dispatched (`HBlankEnd` event, `line == 160` branch).
 - `../2026-04-25_pokemon-audio-dma-reanchor.md` — full investigation log that led to this auto-reset.
+- `../2026-07-01_hod-emerald-m4a-sfx-smearing.md` — the gate-too-tight regression (2→8 frames) this note now reflects.

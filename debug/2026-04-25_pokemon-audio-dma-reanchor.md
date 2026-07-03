@@ -131,6 +131,10 @@ samples to a buffer that DMA has already moved past.
   accuracy bug along a specific path our test ROMs don't exercise.
 - [ ] Investigate remaining "minor background noise" — likely mixer
   scaling or oversampling-related, not CPU.
-- [ ] Confirm this fix doesn't break other games (e.g. ones that DO
+- [x] Confirm this fix doesn't break other games (e.g. ones that DO
   explicitly manage DMA source across buffers and might not want our
-  re-anchor).
+  re-anchor). **It did.** The re-anchor's recency gate was hardcoded at
+  2 frames — narrower than the 7-frame M4A `pcmDmaPeriod` that HoD and
+  Emerald use — so it rewound their self-managed buffers mid-playback and
+  smeared SFX transients. Fixed 2026-07-01 by widening the gate to 8 frames.
+  See `2026-07-01_hod-emerald-m4a-sfx-smearing.md`.

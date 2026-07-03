@@ -23,6 +23,8 @@ This folder stores three kinds of documents:
 | 2026-05-19 | [Pokémon HBlank DMA during VBlank](2026-05-19_pokemon-hblank-dma-vblank.md) | **Fixed** |
 | 2026-05-23 | [Pokémon Emerald BIOS open-bus latch](2026-05-23_pokemon-emerald-bios-open-bus.md) | **Fixed** |
 | 2026-05-24 | [FE7 HBlank/audio IRQ cascade](2026-05-24_fe7-hblank-irq-cascade.md) | **Fixed** |
+| 2026-06-21 | [CPU timing / GamePak prefetch + wait-states (WIP)](2026-06-21_cpu-timing-prefetch-wip.md) | **WIP** (gated) |
+| 2026-07-01 | [HoD/Emerald M4A SFX smearing: VBlank re-anchor gate too tight](2026-07-01_hod-emerald-m4a-sfx-smearing.md) | **Fixed** |
 
 ## Concept notes
 
